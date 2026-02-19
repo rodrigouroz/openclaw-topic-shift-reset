@@ -1,0 +1,40 @@
+{
+  "name": "openclaw-topic-shift-reset",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin that detects topic shifts and starts a fresh session automatically.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target=node --format=esm --external openclaw/plugin-sdk",
+    "clean": "rm -rf dist",
+    "dev": "bun build src/index.ts --outdir dist --target=node --format=esm --external openclaw/plugin-sdk --watch",
+    "prepack": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "session",
+    "topic-shift"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.2.18"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}

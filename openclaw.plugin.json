@@ -1,0 +1,94 @@
+{
+  "id": "topic-shift-reset",
+  "name": "Topic Shift Reset",
+  "description": "Detects major subject changes and rotates to a fresh OpenClaw session automatically.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "historyWindow": {
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 30,
+        "default": 8
+      },
+      "minHistoryMessages": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "default": 3
+      },
+      "minMeaningfulTokens": {
+        "type": "integer",
+        "minimum": 2,
+        "maximum": 40,
+        "default": 6
+      },
+      "similarityThreshold": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.18
+      },
+      "minNoveltyRatio": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.72
+      },
+      "consecutiveSignals": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 4,
+        "default": 2
+      },
+      "cooldownMinutes": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 240,
+        "default": 5
+      },
+      "ignoredProviders": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "dryRun": {
+        "type": "boolean",
+        "default": false
+      },
+      "debug": {
+        "type": "boolean",
+        "default": false
+      }
+    }
+  },
+  "uiHints": {
+    "similarityThreshold": {
+      "label": "Similarity Threshold",
+      "help": "Lower values make resets less frequent. 0.18 is a conservative default."
+    },
+    "minNoveltyRatio": {
+      "label": "Novelty Ratio",
+      "help": "Portion of tokens that must be new relative to recent history."
+    },
+    "consecutiveSignals": {
+      "label": "Consecutive Signals",
+      "help": "Require this many drift detections in a row before rotating session."
+    },
+    "dryRun": {
+      "label": "Dry Run",
+      "help": "Only log would-reset decisions; do not rotate session IDs."
+    },
+    "debug": {
+      "label": "Debug Logs",
+      "help": "Emit per-message similarity/novelty metrics."
+    }
+  }
+}
