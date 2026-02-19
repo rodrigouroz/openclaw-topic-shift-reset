@@ -1,63 +1,29 @@
 {
-  "id": "topic-shift-reset",
+  "id": "openclaw-topic-shift-reset",
   "name": "Topic Shift Reset",
-  "description": "Detects major subject changes and rotates to a fresh OpenClaw session automatically.",
+  "description": "Detects subject shifts and rotates to a fresh OpenClaw session with optional context handoff.",
   "configSchema": {
     "type": "object",
-    "additionalProperties": false,
+    "additionalProperties": true,
     "properties": {
       "enabled": {
         "type": "boolean",
         "default": true
       },
-      "historyWindow": {
-        "type": "integer",
-        "minimum": 2,
-        "maximum": 30,
-        "default": 8
+      "preset": {
+        "type": "string",
+        "enum": ["conservative", "balanced", "aggressive"],
+        "default": "balanced"
       },
-      "minHistoryMessages": {
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 20,
-        "default": 3
+      "embeddings": {
+        "type": "string",
+        "enum": ["auto", "none", "openai", "ollama"],
+        "default": "auto"
       },
-      "minMeaningfulTokens": {
-        "type": "integer",
-        "minimum": 2,
-        "maximum": 40,
-        "default": 6
-      },
-      "similarityThreshold": {
-        "type": "number",
-        "minimum": 0,
-        "maximum": 1,
-        "default": 0.18
-      },
-      "minNoveltyRatio": {
-        "type": "number",
-        "minimum": 0,
-        "maximum": 1,
-        "default": 0.72
-      },
-      "consecutiveSignals": {
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 4,
-        "default": 2
-      },
-      "cooldownMinutes": {
-        "type": "integer",
-        "minimum": 0,
-        "maximum": 240,
-        "default": 5
-      },
-      "ignoredProviders": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "default": []
+      "handoff": {
+        "type": "string",
+        "enum": ["none", "summary", "verbatim"],
+        "default": "summary"
       },
       "dryRun": {
         "type": "boolean",
@@ -66,29 +32,164 @@
       "debug": {
         "type": "boolean",
         "default": false
+      },
+      "advanced": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "historyWindow": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 40,
+            "default": 10
+          },
+          "minHistoryMessages": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "default": 3
+          },
+          "minMeaningfulTokens": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 60,
+            "default": 6
+          },
+          "minTokenLength": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8,
+            "default": 2
+          },
+          "softConsecutiveSignals": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4,
+            "default": 2
+          },
+          "cooldownMinutes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 240,
+            "default": 5
+          },
+          "softScoreThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.72
+          },
+          "hardScoreThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.86
+          },
+          "softSimilarityThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.36
+          },
+          "hardSimilarityThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.24
+          },
+          "softNoveltyThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.58
+          },
+          "hardNoveltyThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.74
+          },
+          "ignoredProviders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "handoff": {
+            "type": "string",
+            "enum": ["none", "summary", "verbatim", "verbatim_last_n"]
+          },
+          "handoffLastN": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 6
+          },
+          "handoffMaxChars": {
+            "type": "integer",
+            "minimum": 60,
+            "maximum": 800,
+            "default": 220
+          },
+          "embeddings": {
+            "type": "string",
+            "enum": ["auto", "none", "openai", "ollama"]
+          },
+          "embedding": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "provider": {
+                "type": "string",
+                "enum": ["auto", "none", "openai", "ollama"],
+                "default": "auto"
+              },
+              "model": {
+                "type": "string"
+              },
+              "baseUrl": {
+                "type": "string"
+              },
+              "apiKey": {
+                "type": "string"
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "minimum": 1000,
+                "maximum": 30000,
+                "default": 7000
+              }
+            }
+          }
+        }
       }
     }
   },
   "uiHints": {
-    "similarityThreshold": {
-      "label": "Similarity Threshold",
-      "help": "Lower values make resets less frequent. 0.18 is a conservative default."
+    "preset": {
+      "label": "Behavior Preset",
+      "help": "conservative = fewer resets, balanced = default, aggressive = faster resets."
     },
-    "minNoveltyRatio": {
-      "label": "Novelty Ratio",
-      "help": "Portion of tokens that must be new relative to recent history."
+    "embeddings": {
+      "label": "Embeddings",
+      "help": "auto uses whichever embedding backend your instance already has configured."
     },
-    "consecutiveSignals": {
-      "label": "Consecutive Signals",
-      "help": "Require this many drift detections in a row before rotating session."
+    "handoff": {
+      "label": "Context Handoff",
+      "help": "summary keeps transitions transparent without copying full transcript."
     },
     "dryRun": {
       "label": "Dry Run",
-      "help": "Only log would-reset decisions; do not rotate session IDs."
+      "help": "Only log decisions; do not rotate sessions."
     },
     "debug": {
       "label": "Debug Logs",
-      "help": "Emit per-message similarity/novelty metrics."
+      "help": "Emit per-message classifier metrics."
+    },
+    "advanced": {
+      "label": "Advanced Overrides",
+      "help": "Optional expert tuning. Leave empty for preset behavior."
     }
   }
 }

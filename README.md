@@ -1,33 +1,22 @@
 # openclaw-topic-shift-reset
 
-OpenClaw plugin that detects conversation topic drift and rotates the session to a fresh `sessionId`.
+OpenClaw plugin that detects topic shifts and rotates to a fresh session automatically.
 
-It runs on the `before_model_resolve` hook, so the reset can happen before the current prompt is processed.
+## Quick start config
 
-Build tooling uses Bun and does not require a dependency install for local builds.
-
-## How it works
-
-- Tracks lexical tokens for each session.
-- Computes drift using:
-  - Jaccard similarity vs. recent history
-  - Novelty ratio (how many tokens are new)
-- Requires configurable consecutive drift signals.
-- On trigger, rewrites the session-store entry with a new `sessionId`.
-
-## Config (plugin entry)
+Most users should only set these fields:
 
 ```json
 {
   "plugins": {
     "entries": {
-      "topic-shift-reset": {
+      "openclaw-topic-shift-reset": {
         "enabled": true,
         "config": {
-          "similarityThreshold": 0.18,
-          "minNoveltyRatio": 0.72,
-          "consecutiveSignals": 2,
-          "cooldownMinutes": 5,
+          "enabled": true,
+          "preset": "balanced",
+          "embeddings": "auto",
+          "handoff": "summary",
           "dryRun": true,
           "debug": true
         }
@@ -37,54 +26,65 @@ Build tooling uses Bun and does not require a dependency install for local build
 }
 ```
 
+Then:
+
+1. Run with `dryRun: true` and `debug: true`.
+2. Send normal messages on one topic.
+3. Switch to a clearly different topic.
+4. Watch logs for `classify`, `suspect`, `rotate-hard`/`rotate-soft`, `dry-run rotate`.
+5. Set `dryRun: false` when behavior looks good.
+
+## Presets
+
+- `conservative`: fewer resets, more confirmation
+- `balanced`: default
+- `aggressive`: faster/more sensitive resets
+
+## Embeddings
+
+`embeddings` supports:
+
+- `auto` (default)
+- `openai`
+- `ollama`
+- `none` (lexical only)
+
+## Install locally
+
+```bash
+openclaw plugins install --link ~/Projects/openclaw-topic-shift-reset
+openclaw plugins enable openclaw-topic-shift-reset
+openclaw plugins info openclaw-topic-shift-reset
+```
+
+Restart gateway after install/config changes.
+
+## Logs
+
+```bash
+openclaw logs --follow --plain | rg topic-shift-reset
+```
+
+## Advanced tuning
+
+Use `config.advanced` only if needed. Full reference:
+
+- `docs/configuration.md`
+
+Legacy top-level tuning keys are still accepted for backward compatibility.
+
 ## Local development
 
-```bash
-bun run build
-```
+No build step is required. OpenClaw loads `src/index.ts` via jiti.
 
-Optional watch mode:
+## Publish
 
 ```bash
-bun run dev
-```
-
-## Local testing with OpenClaw
-
-`openclaw plugins install --link` is the recommended path. You do not need `npm link`.
-
-```bash
-openclaw plugins install --link /absolute/path/to/openclaw-topic-shift-reset
-openclaw plugins enable topic-shift-reset
-openclaw plugins info topic-shift-reset
-```
-
-Then restart your OpenClaw gateway process.
-
-Suggested first test:
-
-- Set `dryRun: true`
-- Set `debug: true`
-- Send 3-5 messages on one topic, then switch to a clearly different topic.
-- Check logs for `would rotate session`.
-
-After tuning, set `dryRun: false`.
-
-## Publish to npm
-
-```bash
-bun run clean
-bun run build
+cd ~/Projects/openclaw-topic-shift-reset
 npm publish
-```
-
-Verify:
-
-```bash
 npm view openclaw-topic-shift-reset version --userconfig "$(mktemp)"
 ```
 
-## Notes
+## Known tradeoff (plugin-only)
 
-- This plugin keeps prior transcript files on disk; it only rotates the active session mapping.
-- Minimum OpenClaw version: `2026.2.18` (plugin SDK/runtime expected by this package).
+This plugin improves timing with fast path + fallback, but cannot guarantee 100% that the triggering message becomes the first persisted message of the new session without core pre-session hooks.
