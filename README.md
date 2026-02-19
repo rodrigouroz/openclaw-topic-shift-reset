@@ -40,6 +40,18 @@ Then:
 - `balanced`: default
 - `aggressive`: faster/more sensitive resets
 
+Default preset internals:
+
+| Key | conservative | balanced | aggressive |
+| --- | --- | --- | --- |
+| `historyWindow` | `12` | `10` | `8` |
+| `minHistoryMessages` | `4` | `3` | `2` |
+| `minMeaningfulTokens` | `7` | `6` | `5` |
+| `softConsecutiveSignals` | `3` | `2` | `1` |
+| `cooldownMinutes` | `10` | `5` | `2` |
+| `softScoreThreshold` | `0.80` | `0.72` | `0.64` |
+| `hardScoreThreshold` | `0.92` | `0.86` | `0.78` |
+
 ## Embeddings
 
 `embeddings` supports:
@@ -71,6 +83,8 @@ Use `config.advanced` only if needed. Full reference:
 
 - `docs/configuration.md`
 
+Tuning keys must be inside `advanced`; top-level tuning keys are rejected by schema validation.
+
 Common guardrail for short acknowledgments:
 
 ```json
@@ -85,8 +99,6 @@ Common guardrail for short acknowledgments:
 ```
 
 This skips classification for very short/low-information messages (for example `ok`, `gracias`, `por favor`).
-
-Legacy top-level tuning keys are still accepted for backward compatibility.
 
 ## Local development
 

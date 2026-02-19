@@ -4,7 +4,7 @@
   "description": "Detects subject shifts and rotates to a fresh OpenClaw session with optional context handoff.",
   "configSchema": {
     "type": "object",
-    "additionalProperties": true,
+    "additionalProperties": false,
     "properties": {
       "enabled": {
         "type": "boolean",

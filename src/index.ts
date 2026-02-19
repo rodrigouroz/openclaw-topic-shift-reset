@@ -54,25 +54,6 @@ type TopicShiftResetConfig = {
   dryRun?: boolean;
   debug?: boolean;
   advanced?: TopicShiftResetAdvancedConfig;
-
-  // Legacy top-level aliases (kept for backward compatibility)
-  historyWindow?: number;
-  minHistoryMessages?: number;
-  minMeaningfulTokens?: number;
-  minTokenLength?: number;
-  softConsecutiveSignals?: number;
-  cooldownMinutes?: number;
-  ignoredProviders?: string[];
-  softScoreThreshold?: number;
-  hardScoreThreshold?: number;
-  softSimilarityThreshold?: number;
-  hardSimilarityThreshold?: number;
-  softNoveltyThreshold?: number;
-  hardNoveltyThreshold?: number;
-  handoffMode?: HandoffMode;
-  handoffLastN?: number;
-  handoffMaxChars?: number;
-  embedding?: EmbeddingConfig;
 };
 
 type ResolvedConfig = {
@@ -339,10 +320,6 @@ function resolveConfig(raw: unknown): ResolvedConfig {
     obj.advanced && typeof obj.advanced === "object"
       ? (obj.advanced as TopicShiftResetAdvancedConfig)
       : {};
-  const legacyEmbedding =
-    obj.embedding && typeof obj.embedding === "object"
-      ? (obj.embedding as EmbeddingConfig)
-      : {};
   const advancedEmbedding =
     advanced.embedding && typeof advanced.embedding === "object"
       ? (advanced.embedding as EmbeddingConfig)
@@ -352,45 +329,28 @@ function resolveConfig(raw: unknown): ResolvedConfig {
   const presetConfig = PRESETS[preset];
 
   const ignoredProviders = new Set(
-    Array.isArray(pickDefined(advanced.ignoredProviders, obj.ignoredProviders))
-      ? (pickDefined(advanced.ignoredProviders, obj.ignoredProviders) as string[])
+    Array.isArray(advanced.ignoredProviders)
+      ? advanced.ignoredProviders
           .map((value) => (typeof value === "string" ? value.trim().toLowerCase() : ""))
           .filter(Boolean)
       : [],
   );
 
-  const handoffPreference = normalizeHandoffPreference(
-    pickDefined(obj.handoff, advanced.handoff, obj.handoffMode),
-  );
+  const handoffPreference = normalizeHandoffPreference(pickDefined(advanced.handoff, obj.handoff));
   const handoffMode: HandoffMode =
     handoffPreference === "verbatim" ? "verbatim_last_n" : handoffPreference;
 
   return {
     enabled: obj.enabled ?? DEFAULTS.enabled,
-    historyWindow: clampInt(
-      pickDefined(advanced.historyWindow, obj.historyWindow),
-      presetConfig.historyWindow,
-      2,
-      40,
-    ),
-    minHistoryMessages: clampInt(
-      pickDefined(advanced.minHistoryMessages, obj.minHistoryMessages),
-      presetConfig.minHistoryMessages,
-      1,
-      30,
-    ),
+    historyWindow: clampInt(advanced.historyWindow, presetConfig.historyWindow, 2, 40),
+    minHistoryMessages: clampInt(advanced.minHistoryMessages, presetConfig.minHistoryMessages, 1, 30),
     minMeaningfulTokens: clampInt(
-      pickDefined(advanced.minMeaningfulTokens, obj.minMeaningfulTokens),
+      advanced.minMeaningfulTokens,
       presetConfig.minMeaningfulTokens,
       2,
       60,
     ),
-    minTokenLength: clampInt(
-      pickDefined(advanced.minTokenLength, obj.minTokenLength),
-      presetConfig.minTokenLength,
-      1,
-      8,
-    ),
+    minTokenLength: clampInt(advanced.minTokenLength, presetConfig.minTokenLength, 1, 8),
     minSignalChars: clampInt(
       advanced.minSignalChars,
       DEFAULTS.minSignalChars,
@@ -411,94 +371,59 @@ function resolveConfig(raw: unknown): ResolvedConfig {
     ),
     stripEnvelope: advanced.stripEnvelope ?? DEFAULTS.stripEnvelope,
     softConsecutiveSignals: clampInt(
-      pickDefined(advanced.softConsecutiveSignals, obj.softConsecutiveSignals),
+      advanced.softConsecutiveSignals,
       presetConfig.softConsecutiveSignals,
       1,
       4,
     ),
-    cooldownMinutes: clampInt(
-      pickDefined(advanced.cooldownMinutes, obj.cooldownMinutes),
-      presetConfig.cooldownMinutes,
-      0,
-      240,
-    ),
+    cooldownMinutes: clampInt(advanced.cooldownMinutes, presetConfig.cooldownMinutes, 0, 240),
     ignoredProviders,
-    softScoreThreshold: clampFloat(
-      pickDefined(advanced.softScoreThreshold, obj.softScoreThreshold),
-      presetConfig.softScoreThreshold,
-      0,
-      1,
-    ),
-    hardScoreThreshold: clampFloat(
-      pickDefined(advanced.hardScoreThreshold, obj.hardScoreThreshold),
-      presetConfig.hardScoreThreshold,
-      0,
-      1,
-    ),
+    softScoreThreshold: clampFloat(advanced.softScoreThreshold, presetConfig.softScoreThreshold, 0, 1),
+    hardScoreThreshold: clampFloat(advanced.hardScoreThreshold, presetConfig.hardScoreThreshold, 0, 1),
     softSimilarityThreshold: clampFloat(
-      pickDefined(advanced.softSimilarityThreshold, obj.softSimilarityThreshold),
+      advanced.softSimilarityThreshold,
       presetConfig.softSimilarityThreshold,
       0,
       1,
     ),
     hardSimilarityThreshold: clampFloat(
-      pickDefined(advanced.hardSimilarityThreshold, obj.hardSimilarityThreshold),
+      advanced.hardSimilarityThreshold,
       presetConfig.hardSimilarityThreshold,
       0,
       1,
     ),
     softNoveltyThreshold: clampFloat(
-      pickDefined(advanced.softNoveltyThreshold, obj.softNoveltyThreshold),
+      advanced.softNoveltyThreshold,
       presetConfig.softNoveltyThreshold,
       0,
       1,
     ),
     hardNoveltyThreshold: clampFloat(
-      pickDefined(advanced.hardNoveltyThreshold, obj.hardNoveltyThreshold),
+      advanced.hardNoveltyThreshold,
       presetConfig.hardNoveltyThreshold,
       0,
       1,
     ),
     handoffMode,
-    handoffLastN: clampInt(
-      pickDefined(advanced.handoffLastN, obj.handoffLastN),
-      DEFAULTS.handoffLastN,
-      1,
-      20,
-    ),
-    handoffMaxChars: clampInt(
-      pickDefined(advanced.handoffMaxChars, obj.handoffMaxChars),
-      DEFAULTS.handoffMaxChars,
-      60,
-      800,
-    ),
+    handoffLastN: clampInt(advanced.handoffLastN, DEFAULTS.handoffLastN, 1, 20),
+    handoffMaxChars: clampInt(advanced.handoffMaxChars, DEFAULTS.handoffMaxChars, 60, 800),
     embedding: {
       provider: normalizeEmbeddingProvider(
-        pickDefined(
-          obj.embeddings,
-          advanced.embeddings,
-          advancedEmbedding.provider,
-          legacyEmbedding.provider,
-        ),
+        pickDefined(advanced.embeddings, advancedEmbedding.provider, obj.embeddings),
       ),
       model: (() => {
-        const rawModel = pickDefined(advancedEmbedding.model, legacyEmbedding.model);
+        const rawModel = advancedEmbedding.model;
         return typeof rawModel === "string" ? rawModel.trim() : undefined;
       })(),
       baseUrl: (() => {
-        const rawBaseUrl = pickDefined(advancedEmbedding.baseUrl, legacyEmbedding.baseUrl);
+        const rawBaseUrl = advancedEmbedding.baseUrl;
         return typeof rawBaseUrl === "string" ? rawBaseUrl.trim() : undefined;
       })(),
       apiKey: (() => {
-        const rawApiKey = pickDefined(advancedEmbedding.apiKey, legacyEmbedding.apiKey);
+        const rawApiKey = advancedEmbedding.apiKey;
         return typeof rawApiKey === "string" ? rawApiKey.trim() : undefined;
       })(),
-      timeoutMs: clampInt(
-        pickDefined(advancedEmbedding.timeoutMs, legacyEmbedding.timeoutMs),
-        DEFAULTS.embeddingTimeoutMs,
-        1000,
-        30_000,
-      ),
+      timeoutMs: clampInt(advancedEmbedding.timeoutMs, DEFAULTS.embeddingTimeoutMs, 1000, 30_000),
     },
     dryRun: obj.dryRun ?? DEFAULTS.dryRun,
     debug: obj.debug ?? DEFAULTS.debug,

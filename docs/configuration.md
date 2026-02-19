@@ -24,25 +24,48 @@ Use this minimal config for normal users:
 - `dryRun`: if `true`, logs decisions but never rotates sessions.
 - `debug`: if `true`, emits per-message metrics logs.
 
-## Preset behavior
+## Built-in presets defaults
 
-### conservative
+`preset` controls the classifier layer. These are the built-in defaults:
 
-- Fewer resets, more confirmation.
-- Higher thresholds and longer cooldown.
+| Key | conservative | balanced (default) | aggressive |
+| --- | --- | --- | --- |
+| `historyWindow` | `12` | `10` | `8` |
+| `minHistoryMessages` | `4` | `3` | `2` |
+| `minMeaningfulTokens` | `7` | `6` | `5` |
+| `minTokenLength` | `2` | `2` | `2` |
+| `softConsecutiveSignals` | `3` | `2` | `1` |
+| `cooldownMinutes` | `10` | `5` | `2` |
+| `softScoreThreshold` | `0.80` | `0.72` | `0.64` |
+| `hardScoreThreshold` | `0.92` | `0.86` | `0.78` |
+| `softSimilarityThreshold` | `0.30` | `0.36` | `0.46` |
+| `hardSimilarityThreshold` | `0.18` | `0.24` | `0.34` |
+| `softNoveltyThreshold` | `0.66` | `0.58` | `0.48` |
+| `hardNoveltyThreshold` | `0.80` | `0.74` | `0.60` |
 
-### balanced (default)
+## Shared defaults
 
-- Current recommended default for most users.
+These defaults apply in all presets unless overridden:
 
-### aggressive
-
-- Faster resets.
-- Lower thresholds and shorter cooldown.
+- `handoff`: `summary`
+- `handoffLastN`: `6`
+- `handoffMaxChars`: `220`
+- `embeddings`: `auto`
+- `embedding.timeoutMs`: `7000`
+- `minSignalChars`: `20`
+- `minSignalTokenCount`: `3`
+- `minSignalEntropy`: `1.2`
+- `stripEnvelope`: `true`
 
 ## Advanced overrides
 
-Power users can override preset internals via `advanced`:
+The runtime resolves config in this order:
+
+1. Built-in preset defaults.
+2. Shared defaults.
+3. `advanced` overrides (only the keys you set).
+
+Power users can override behavior via `advanced`:
 
 ```json
 {
@@ -91,6 +114,11 @@ Advanced keys:
 - `embedding.apiKey`
 - `embedding.timeoutMs`
 
+Notes:
+
+- Top-level public keys stay minimal: `enabled`, `preset`, `embeddings`, `handoff`, `dryRun`, `debug`.
+- Tuning keys outside `advanced` are rejected by config schema validation.
+
 ## Log interpretation
 
 Classifier logs look like:
@@ -119,7 +147,3 @@ Other lines:
 
 - `dry-run rotate`: would have rotated, but `dryRun=true`.
 - `rotated`: actual session rotation happened.
-
-## Backward compatibility
-
-Legacy top-level tuning keys are still accepted by the runtime parser for existing configs. New configs should use the simplified public fields plus optional `advanced` overrides.
