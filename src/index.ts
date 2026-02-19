@@ -26,6 +26,10 @@ type TopicShiftResetAdvancedConfig = {
   minHistoryMessages?: number;
   minMeaningfulTokens?: number;
   minTokenLength?: number;
+  minSignalChars?: number;
+  minSignalTokenCount?: number;
+  minSignalEntropy?: number;
+  stripEnvelope?: boolean;
   softConsecutiveSignals?: number;
   cooldownMinutes?: number;
   ignoredProviders?: string[];
@@ -77,6 +81,10 @@ type ResolvedConfig = {
   minHistoryMessages: number;
   minMeaningfulTokens: number;
   minTokenLength: number;
+  minSignalChars: number;
+  minSignalTokenCount: number;
+  minSignalEntropy: number;
+  stripEnvelope: boolean;
   softConsecutiveSignals: number;
   cooldownMinutes: number;
   ignoredProviders: Set<string>;
@@ -223,6 +231,10 @@ const DEFAULTS = {
   handoffMaxChars: 220,
   embeddingProvider: "auto" as EmbeddingProvider,
   embeddingTimeoutMs: 7000,
+  minSignalChars: 20,
+  minSignalTokenCount: 3,
+  minSignalEntropy: 1.2,
+  stripEnvelope: true,
   dryRun: false,
   debug: false,
 } as const;
@@ -379,6 +391,25 @@ function resolveConfig(raw: unknown): ResolvedConfig {
       1,
       8,
     ),
+    minSignalChars: clampInt(
+      advanced.minSignalChars,
+      DEFAULTS.minSignalChars,
+      1,
+      500,
+    ),
+    minSignalTokenCount: clampInt(
+      advanced.minSignalTokenCount,
+      DEFAULTS.minSignalTokenCount,
+      1,
+      60,
+    ),
+    minSignalEntropy: clampFloat(
+      advanced.minSignalEntropy,
+      DEFAULTS.minSignalEntropy,
+      0,
+      8,
+    ),
+    stripEnvelope: advanced.stripEnvelope ?? DEFAULTS.stripEnvelope,
     softConsecutiveSignals: clampInt(
       pickDefined(advanced.softConsecutiveSignals, obj.softConsecutiveSignals),
       presetConfig.softConsecutiveSignals,
@@ -492,21 +523,87 @@ function normalizeTextForHash(text: string): string {
     .trim();
 }
 
-function tokenize(text: string, minTokenLength: number): Set<string> {
+function tokenizeList(text: string, minTokenLength: number): string[] {
   const normalized = text
     .normalize("NFKC")
     .toLowerCase()
     .replace(/https?:\/\/\S+/g, " ");
-
-  const matches = normalized.match(/[\p{L}\p{N}][\p{L}\p{N}_-]*/gu) ?? [];
-  const out = new Set<string>();
-  for (const token of matches) {
+  const out: string[] = [];
+  for (const token of normalized.match(/[\p{L}\p{N}][\p{L}\p{N}_-]*/gu) ?? []) {
     if (token.length < minTokenLength) {
       continue;
     }
-    out.add(token);
+    out.push(token);
   }
   return out;
+}
+
+function tokenize(text: string, minTokenLength: number): Set<string> {
+  return new Set(tokenizeList(text, minTokenLength));
+}
+
+function tokenEntropy(tokens: string[]): number {
+  if (tokens.length === 0) {
+    return 0;
+  }
+  const counts = new Map<string, number>();
+  for (const token of tokens) {
+    counts.set(token, (counts.get(token) ?? 0) + 1);
+  }
+  const total = tokens.length;
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const p = count / total;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function stripClassifierEnvelope(text: string): string {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const kept: string[] = [];
+  let skipFence = false;
+  let expectingMetadataFence = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (skipFence) {
+      if (trimmed.startsWith("```")) {
+        skipFence = false;
+      }
+      continue;
+    }
+
+    if (
+      trimmed === "Conversation info (untrusted metadata):" ||
+      trimmed === "Replied message (untrusted, for context):"
+    ) {
+      expectingMetadataFence = true;
+      continue;
+    }
+
+    if (expectingMetadataFence && trimmed.startsWith("```")) {
+      skipFence = true;
+      expectingMetadataFence = false;
+      continue;
+    }
+
+    expectingMetadataFence = false;
+
+    if (
+      trimmed.startsWith("System: [") ||
+      trimmed.startsWith("Current time:") ||
+      trimmed.startsWith("Read HEARTBEAT.md if it exists") ||
+      trimmed.startsWith("To send an image back, prefer the message tool") ||
+      trimmed.startsWith("[media attached:")
+    ) {
+      continue;
+    }
+
+    kept.push(line);
+  }
+
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function unionTokens(entries: HistoryEntry[]): Set<string> {
@@ -1168,12 +1265,35 @@ export default function register(api: OpenClawPluginApi): void {
       return;
     }
 
-    const text = params.text.trim();
+    const rawText = params.text.trim();
+    const text = cfg.stripEnvelope ? stripClassifierEnvelope(rawText) : rawText;
     if (!text || text.startsWith("/")) {
       return;
     }
 
-    const tokens = tokenize(text, cfg.minTokenLength);
+    const tokenList = tokenizeList(text, cfg.minTokenLength);
+    const signalEntropy = tokenEntropy(tokenList);
+    if (
+      text.length < cfg.minSignalChars ||
+      tokenList.length < cfg.minSignalTokenCount ||
+      signalEntropy < cfg.minSignalEntropy
+    ) {
+      if (cfg.debug) {
+        api.logger.info(
+          [
+            `topic-shift-reset: skip-low-signal`,
+            `source=${params.source}`,
+            `session=${sessionKey}`,
+            `chars=${text.length}`,
+            `tokens=${tokenList.length}`,
+            `entropy=${signalEntropy.toFixed(3)}`,
+          ].join(" "),
+        );
+      }
+      return;
+    }
+
+    const tokens = new Set(tokenList);
     if (tokens.size < cfg.minMeaningfulTokens) {
       return;
     }

@@ -71,6 +71,21 @@ Use `config.advanced` only if needed. Full reference:
 
 - `docs/configuration.md`
 
+Common guardrail for short acknowledgments:
+
+```json
+{
+  "advanced": {
+    "minSignalChars": 20,
+    "minSignalTokenCount": 3,
+    "minSignalEntropy": 1.2,
+    "stripEnvelope": true
+  }
+}
+```
+
+This skips classification for very short/low-information messages (for example `ok`, `gracias`, `por favor`).
+
 Legacy top-level tuning keys are still accepted for backward compatibility.
 
 ## Local development

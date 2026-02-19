@@ -61,6 +61,28 @@
             "maximum": 8,
             "default": 2
           },
+          "minSignalChars": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500,
+            "default": 20
+          },
+          "minSignalTokenCount": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60,
+            "default": 3
+          },
+          "minSignalEntropy": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 8,
+            "default": 1.2
+          },
+          "stripEnvelope": {
+            "type": "boolean",
+            "default": true
+          },
           "softConsecutiveSignals": {
             "type": "integer",
             "minimum": 1,

@@ -49,6 +49,7 @@ Power users can override preset internals via `advanced`:
   "preset": "balanced",
   "advanced": {
     "cooldownMinutes": 3,
+    "minSignalEntropy": 1.4,
     "softConsecutiveSignals": 2,
     "softScoreThreshold": 0.7,
     "hardScoreThreshold": 0.84,
@@ -67,6 +68,10 @@ Advanced keys:
 - `minHistoryMessages`
 - `minMeaningfulTokens`
 - `minTokenLength`
+- `minSignalChars`
+- `minSignalTokenCount`
+- `minSignalEntropy`
+- `stripEnvelope`
 - `softConsecutiveSignals`
 - `cooldownMinutes`
 - `softScoreThreshold`
@@ -105,6 +110,7 @@ Reasons:
 - `warmup`
 - `stable`
 - `cooldown`
+- `skip-low-signal`
 - `soft-suspect`
 - `soft-confirmed`
 - `hard-threshold`
