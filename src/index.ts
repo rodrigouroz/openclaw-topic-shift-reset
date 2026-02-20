@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { OpenClawPluginApi, PluginHookMessageReceivedEvent } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import {
   readJsonFileWithFallback,
   withFileLock,
@@ -11,7 +11,6 @@ import {
 type PresetName = "conservative" | "balanced" | "aggressive";
 type EmbeddingProvider = "auto" | "none" | "openai" | "ollama";
 type HandoffMode = "none" | "summary" | "verbatim_last_n";
-type HandoffPreference = "none" | "summary" | "verbatim";
 
 type EmbeddingConfig = {
   provider?: EmbeddingProvider;
@@ -19,6 +18,18 @@ type EmbeddingConfig = {
   baseUrl?: string;
   apiKey?: string;
   timeoutMs?: number;
+};
+
+type HandoffConfig = {
+  mode?: HandoffMode;
+  lastN?: number;
+  maxChars?: number;
+};
+
+type StripRulesConfig = {
+  dropLinePrefixPatterns?: string[];
+  dropExactLines?: string[];
+  dropFencedBlockAfterHeaderPatterns?: string[];
 };
 
 type TopicShiftResetAdvancedConfig = {
@@ -29,7 +40,12 @@ type TopicShiftResetAdvancedConfig = {
   minSignalChars?: number;
   minSignalTokenCount?: number;
   minSignalEntropy?: number;
+  minUniqueTokenRatio?: number;
+  shortMessageTokenLimit?: number;
+  embeddingTriggerMargin?: number;
   stripEnvelope?: boolean;
+  stripRules?: StripRulesConfig;
+  handoffTailReadMaxBytes?: number;
   softConsecutiveSignals?: number;
   cooldownMinutes?: number;
   ignoredProviders?: string[];
@@ -39,18 +55,13 @@ type TopicShiftResetAdvancedConfig = {
   hardSimilarityThreshold?: number;
   softNoveltyThreshold?: number;
   hardNoveltyThreshold?: number;
-  handoff?: HandoffPreference | HandoffMode;
-  handoffLastN?: number;
-  handoffMaxChars?: number;
-  embeddings?: EmbeddingProvider;
-  embedding?: EmbeddingConfig;
 };
 
 type TopicShiftResetConfig = {
   enabled?: boolean;
   preset?: PresetName;
-  embeddings?: EmbeddingProvider;
-  handoff?: HandoffPreference;
+  embedding?: EmbeddingConfig;
+  handoff?: HandoffConfig;
   dryRun?: boolean;
   debug?: boolean;
   advanced?: TopicShiftResetAdvancedConfig;
@@ -65,7 +76,16 @@ type ResolvedConfig = {
   minSignalChars: number;
   minSignalTokenCount: number;
   minSignalEntropy: number;
+  minUniqueTokenRatio: number;
+  shortMessageTokenLimit: number;
+  embeddingTriggerMargin: number;
   stripEnvelope: boolean;
+  stripRules: {
+    dropLinePrefixPatterns: RegExp[];
+    dropExactLines: Set<string>;
+    dropFencedBlockAfterHeaderPatterns: RegExp[];
+  };
+  handoffTailReadMaxBytes: number;
   softConsecutiveSignals: number;
   cooldownMinutes: number;
   ignoredProviders: Set<string>;
@@ -75,9 +95,11 @@ type ResolvedConfig = {
   hardSimilarityThreshold: number;
   softNoveltyThreshold: number;
   hardNoveltyThreshold: number;
-  handoffMode: HandoffMode;
-  handoffLastN: number;
-  handoffMaxChars: number;
+  handoff: {
+    mode: HandoffMode;
+    lastN: number;
+    maxChars: number;
+  };
   embedding: {
     provider: EmbeddingProvider;
     model?: string;
@@ -113,6 +135,9 @@ type SessionState = {
   pendingSoftSignals: number;
   pendingEntries: HistoryEntry[];
   lastResetAt?: number;
+  topicCentroid?: number[];
+  topicCount: number;
+  topicDim?: number;
   lastSeenAt: number;
 };
 
@@ -120,9 +145,19 @@ type ClassifierMetrics = {
   score: number;
   novelty: number;
   lexicalDistance: number;
+  uniqueTokenRatio: number;
+  entropy: number;
   similarity?: number;
   usedEmbedding: boolean;
   pendingSoftSignals: number;
+};
+
+type LexicalFeatures = {
+  score: number;
+  novelty: number;
+  lexicalDistance: number;
+  uniqueTokenRatio: number;
+  entropy: number;
 };
 
 type ClassificationDecision =
@@ -134,9 +169,9 @@ type EmbeddingBackend = {
   embed: (text: string) => Promise<number[] | null>;
 };
 
-type ResolvedFastSession = {
-  sessionKey: string;
-  routeKind: "direct" | "group" | "thread";
+type FastMessageEventLike = {
+  from?: string;
+  metadata?: Record<string, unknown>;
 };
 
 type TranscriptMessage = {
@@ -207,7 +242,7 @@ const PRESETS = {
 const DEFAULTS = {
   enabled: true,
   preset: "balanced" as PresetName,
-  handoff: "summary" as HandoffPreference,
+  handoffMode: "summary" as HandoffMode,
   handoffLastN: 6,
   handoffMaxChars: 220,
   embeddingProvider: "auto" as EmbeddingProvider,
@@ -215,7 +250,18 @@ const DEFAULTS = {
   minSignalChars: 20,
   minSignalTokenCount: 3,
   minSignalEntropy: 1.2,
+  minUniqueTokenRatio: 0.34,
+  shortMessageTokenLimit: 6,
+  embeddingTriggerMargin: 0.08,
   stripEnvelope: true,
+  stripDropLinePrefixPatterns: [
+    "^[A-Za-z][A-Za-z _-]{0,30}:\\s*\\[",
+  ],
+  stripDropExactLines: [] as string[],
+  stripDropFencedBlockAfterHeaderPatterns: [
+    "^[A-Za-z][A-Za-z _-]{0,40}:\\s*\\([^)]*(metadata|context)[^)]*\\):?$",
+  ],
+  handoffTailReadMaxBytes: 512 * 1024,
   dryRun: false,
   debug: false,
 } as const;
@@ -264,15 +310,6 @@ function clampFloat(value: unknown, fallback: number, min: number, max: number):
   return value;
 }
 
-function pickDefined<T>(...values: Array<T | undefined>): T | undefined {
-  for (const value of values) {
-    if (value !== undefined) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
 function normalizePreset(value: unknown): PresetName {
   if (typeof value !== "string") {
     return DEFAULTS.preset;
@@ -300,18 +337,94 @@ function normalizeEmbeddingProvider(value: unknown): EmbeddingProvider {
   return DEFAULTS.embeddingProvider;
 }
 
-function normalizeHandoffPreference(value: unknown): HandoffPreference {
+function normalizeHandoffMode(value: unknown): HandoffMode {
   if (typeof value !== "string") {
-    return DEFAULTS.handoff;
+    return DEFAULTS.handoffMode;
   }
   const normalized = value.trim().toLowerCase();
-  if (normalized === "none" || normalized === "summary") {
-    return normalized;
+  if (normalized === "none" || normalized === "summary" || normalized === "verbatim_last_n") {
+    return normalized as HandoffMode;
   }
-  if (normalized === "verbatim" || normalized === "verbatim_last_n") {
-    return "verbatim";
+  return DEFAULTS.handoffMode;
+}
+
+function compileRegexList(values: unknown, fallback: readonly string[]): RegExp[] {
+  const source = Array.isArray(values) ? values : fallback;
+  const out: RegExp[] = [];
+  for (const item of source) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    const pattern = item.trim();
+    if (!pattern) {
+      continue;
+    }
+    try {
+      out.push(new RegExp(pattern));
+    } catch {
+      continue;
+    }
   }
-  return DEFAULTS.handoff;
+  return out;
+}
+
+function normalizeStringList(values: unknown, fallback: readonly string[]): string[] {
+  const source = Array.isArray(values) ? values : fallback;
+  return source
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeProviderId(raw: string): string {
+  const provider = raw.trim().toLowerCase();
+  if (!provider) {
+    return "";
+  }
+  if (provider === "telegram" || provider.includes("telegram")) {
+    return "telegram";
+  }
+  if (
+    provider === "whatsapp" ||
+    provider.includes("whatsapp") ||
+    provider.includes("baileys")
+  ) {
+    return "whatsapp";
+  }
+  if (provider === "signal" || provider.includes("signal")) {
+    return "signal";
+  }
+  if (provider === "discord" || provider.includes("discord")) {
+    return "discord";
+  }
+  if (provider === "slack" || provider.includes("slack")) {
+    return "slack";
+  }
+  if (provider === "matrix" || provider.includes("matrix")) {
+    return "matrix";
+  }
+  if (provider === "msteams" || provider.includes("teams")) {
+    return "msteams";
+  }
+  if (provider === "imessage" || provider.includes("imessage") || provider.includes("bluebubbles")) {
+    return "imessage";
+  }
+  if (provider === "web" || provider.includes("webchat")) {
+    return "web";
+  }
+  if (provider === "voice" || provider.includes("voice")) {
+    return "voice";
+  }
+  if (provider.includes("openai")) {
+    return "openai";
+  }
+  if (provider.includes("anthropic")) {
+    return "anthropic";
+  }
+  if (provider.includes("ollama")) {
+    return "ollama";
+  }
+  return provider;
 }
 
 function resolveConfig(raw: unknown): ResolvedConfig {
@@ -320,9 +433,13 @@ function resolveConfig(raw: unknown): ResolvedConfig {
     obj.advanced && typeof obj.advanced === "object"
       ? (obj.advanced as TopicShiftResetAdvancedConfig)
       : {};
-  const advancedEmbedding =
-    advanced.embedding && typeof advanced.embedding === "object"
-      ? (advanced.embedding as EmbeddingConfig)
+  const embedding =
+    obj.embedding && typeof obj.embedding === "object" ? (obj.embedding as EmbeddingConfig) : {};
+  const handoff =
+    obj.handoff && typeof obj.handoff === "object" ? (obj.handoff as HandoffConfig) : {};
+  const stripRules =
+    advanced.stripRules && typeof advanced.stripRules === "object"
+      ? (advanced.stripRules as StripRulesConfig)
       : {};
 
   const preset = normalizePreset(obj.preset);
@@ -331,14 +448,12 @@ function resolveConfig(raw: unknown): ResolvedConfig {
   const ignoredProviders = new Set(
     Array.isArray(advanced.ignoredProviders)
       ? advanced.ignoredProviders
-          .map((value) => (typeof value === "string" ? value.trim().toLowerCase() : ""))
+          .map((value) =>
+            typeof value === "string" ? normalizeProviderId(value.trim().toLowerCase()) : "",
+          )
           .filter(Boolean)
       : [],
   );
-
-  const handoffPreference = normalizeHandoffPreference(pickDefined(advanced.handoff, obj.handoff));
-  const handoffMode: HandoffMode =
-    handoffPreference === "verbatim" ? "verbatim_last_n" : handoffPreference;
 
   return {
     enabled: obj.enabled ?? DEFAULTS.enabled,
@@ -369,7 +484,44 @@ function resolveConfig(raw: unknown): ResolvedConfig {
       0,
       8,
     ),
+    minUniqueTokenRatio: clampFloat(
+      advanced.minUniqueTokenRatio,
+      DEFAULTS.minUniqueTokenRatio,
+      0,
+      1,
+    ),
+    shortMessageTokenLimit: clampInt(
+      advanced.shortMessageTokenLimit,
+      DEFAULTS.shortMessageTokenLimit,
+      1,
+      40,
+    ),
+    embeddingTriggerMargin: clampFloat(
+      advanced.embeddingTriggerMargin,
+      DEFAULTS.embeddingTriggerMargin,
+      0,
+      0.5,
+    ),
     stripEnvelope: advanced.stripEnvelope ?? DEFAULTS.stripEnvelope,
+    stripRules: {
+      dropLinePrefixPatterns: compileRegexList(
+        stripRules.dropLinePrefixPatterns,
+        DEFAULTS.stripDropLinePrefixPatterns,
+      ),
+      dropExactLines: new Set(
+        normalizeStringList(stripRules.dropExactLines, DEFAULTS.stripDropExactLines),
+      ),
+      dropFencedBlockAfterHeaderPatterns: compileRegexList(
+        stripRules.dropFencedBlockAfterHeaderPatterns,
+        DEFAULTS.stripDropFencedBlockAfterHeaderPatterns,
+      ),
+    },
+    handoffTailReadMaxBytes: clampInt(
+      advanced.handoffTailReadMaxBytes,
+      DEFAULTS.handoffTailReadMaxBytes,
+      64 * 1024,
+      8 * 1024 * 1024,
+    ),
     softConsecutiveSignals: clampInt(
       advanced.softConsecutiveSignals,
       presetConfig.softConsecutiveSignals,
@@ -404,26 +556,26 @@ function resolveConfig(raw: unknown): ResolvedConfig {
       0,
       1,
     ),
-    handoffMode,
-    handoffLastN: clampInt(advanced.handoffLastN, DEFAULTS.handoffLastN, 1, 20),
-    handoffMaxChars: clampInt(advanced.handoffMaxChars, DEFAULTS.handoffMaxChars, 60, 800),
+    handoff: {
+      mode: normalizeHandoffMode(handoff.mode),
+      lastN: clampInt(handoff.lastN, DEFAULTS.handoffLastN, 1, 20),
+      maxChars: clampInt(handoff.maxChars, DEFAULTS.handoffMaxChars, 60, 800),
+    },
     embedding: {
-      provider: normalizeEmbeddingProvider(
-        pickDefined(advanced.embeddings, advancedEmbedding.provider, obj.embeddings),
-      ),
+      provider: normalizeEmbeddingProvider(embedding.provider),
       model: (() => {
-        const rawModel = advancedEmbedding.model;
+        const rawModel = embedding.model;
         return typeof rawModel === "string" ? rawModel.trim() : undefined;
       })(),
       baseUrl: (() => {
-        const rawBaseUrl = advancedEmbedding.baseUrl;
+        const rawBaseUrl = embedding.baseUrl;
         return typeof rawBaseUrl === "string" ? rawBaseUrl.trim() : undefined;
       })(),
       apiKey: (() => {
-        const rawApiKey = advancedEmbedding.apiKey;
+        const rawApiKey = embedding.apiKey;
         return typeof rawApiKey === "string" ? rawApiKey.trim() : undefined;
       })(),
-      timeoutMs: clampInt(advancedEmbedding.timeoutMs, DEFAULTS.embeddingTimeoutMs, 1000, 30_000),
+      timeoutMs: clampInt(embedding.timeoutMs, DEFAULTS.embeddingTimeoutMs, 1000, 30_000),
     },
     dryRun: obj.dryRun ?? DEFAULTS.dryRun,
     debug: obj.debug ?? DEFAULTS.debug,
@@ -484,13 +636,27 @@ function tokenEntropy(tokens: string[]): number {
   return entropy;
 }
 
-function stripClassifierEnvelope(text: string): string {
+function matchesAny(patterns: RegExp[], value: string): boolean {
+  for (const pattern of patterns) {
+    if (pattern.test(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function stripClassifierEnvelope(
+  text: string,
+  rules: ResolvedConfig["stripRules"],
+): string {
   const lines = text.replace(/\r\n/g, "\n").split("\n");
   const kept: string[] = [];
   let skipFence = false;
   let expectingMetadataFence = false;
+  let sawSemanticContent = false;
 
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
     const trimmed = line.trim();
     if (skipFence) {
       if (trimmed.startsWith("```")) {
@@ -499,11 +665,14 @@ function stripClassifierEnvelope(text: string): string {
       continue;
     }
 
-    if (
-      trimmed === "Conversation info (untrusted metadata):" ||
-      trimmed === "Replied message (untrusted, for context):"
-    ) {
+    if (matchesAny(rules.dropFencedBlockAfterHeaderPatterns, trimmed)) {
       expectingMetadataFence = true;
+      continue;
+    }
+
+    // Drop top fenced metadata envelopes even if header wording changes.
+    if (!sawSemanticContent && index < 12 && (trimmed === "```" || trimmed === "```json")) {
+      skipFence = true;
       continue;
     }
 
@@ -515,17 +684,14 @@ function stripClassifierEnvelope(text: string): string {
 
     expectingMetadataFence = false;
 
-    if (
-      trimmed.startsWith("System: [") ||
-      trimmed.startsWith("Current time:") ||
-      trimmed.startsWith("Read HEARTBEAT.md if it exists") ||
-      trimmed.startsWith("To send an image back, prefer the message tool") ||
-      trimmed.startsWith("[media attached:")
-    ) {
+    if (rules.dropExactLines.has(trimmed) || matchesAny(rules.dropLinePrefixPatterns, trimmed)) {
       continue;
     }
 
     kept.push(line);
+    if (trimmed) {
+      sawSemanticContent = true;
+    }
   }
 
   return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
@@ -592,29 +758,36 @@ function cosineSimilarity(a: number[], b: number[]): number | undefined {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-function centroid(vectors: number[][]): number[] | undefined {
-  if (vectors.length === 0) {
-    return undefined;
+function seedTopicCentroid(state: SessionState, vector?: number[]): void {
+  if (!Array.isArray(vector) || vector.length === 0) {
+    state.topicCentroid = undefined;
+    state.topicCount = 0;
+    state.topicDim = undefined;
+    return;
   }
-  const dim = vectors[0]?.length ?? 0;
-  if (!dim) {
-    return undefined;
+  state.topicCentroid = [...vector];
+  state.topicCount = 1;
+  state.topicDim = vector.length;
+}
+
+function updateTopicCentroid(state: SessionState, vector?: number[]): void {
+  if (!Array.isArray(vector) || vector.length === 0) {
+    return;
   }
-  for (const vector of vectors) {
-    if (vector.length !== dim) {
-      return undefined;
-    }
+  if (
+    !Array.isArray(state.topicCentroid) ||
+    state.topicCentroid.length !== vector.length ||
+    !state.topicCount
+  ) {
+    seedTopicCentroid(state, vector);
+    return;
   }
-  const out = new Array<number>(dim).fill(0);
-  for (const vector of vectors) {
-    for (let i = 0; i < dim; i += 1) {
-      out[i] += vector[i];
-    }
+  const nextCount = state.topicCount + 1;
+  for (let i = 0; i < vector.length; i += 1) {
+    state.topicCentroid[i] += (vector[i] - state.topicCentroid[i]) / nextCount;
   }
-  for (let i = 0; i < dim; i += 1) {
-    out[i] /= vectors.length;
-  }
-  return out;
+  state.topicCount = nextCount;
+  state.topicDim = vector.length;
 }
 
 function trimHistory(entries: HistoryEntry[], limit: number): HistoryEntry[] {
@@ -645,7 +818,10 @@ function looksLikeGroup(value?: string): boolean {
   );
 }
 
-function inferFastPeer(event: PluginHookMessageReceivedEvent, ctx: { conversationId?: string }) {
+function inferFastPeer(
+  event: FastMessageEventLike,
+  ctx: { conversationId?: string },
+): { kind: "direct" | "group" | "channel"; id: string } {
   const from = event.from?.trim() ?? "";
   const conversationId = ctx.conversationId?.trim() || from;
   const metadata = (event.metadata ?? {}) as Record<string, unknown>;
@@ -659,12 +835,13 @@ function inferFastPeer(event: PluginHookMessageReceivedEvent, ctx: { conversatio
 
   if (threadId) {
     return {
-      kind: "thread" as const,
+      kind: "group",
       id: `${conversationId || from}:thread:${threadId}`,
     };
   }
 
-  const kind = looksLikeGroup(conversationId) || looksLikeGroup(from) ? "group" : "direct";
+  const kind: "group" | "direct" =
+    looksLikeGroup(conversationId) || looksLikeGroup(from) ? "group" : "direct";
   return {
     kind,
     id: conversationId || from || "unknown",
@@ -763,45 +940,84 @@ function resolveEmbeddingBackend(cfg: ResolvedConfig): EmbeddingBackend | null {
   return createOllamaBackend(cfg);
 }
 
+function computeLexicalFeatures(params: {
+  cfg: ResolvedConfig;
+  entry: HistoryEntry;
+  tokenList: string[];
+  baselineTokens: Set<string>;
+}): LexicalFeatures {
+  const lexicalSimilarity = jaccardSimilarity(params.entry.tokens, params.baselineTokens);
+  const lexicalDistance = 1 - lexicalSimilarity;
+  const novelty = noveltyRatio(params.entry.tokens, params.baselineTokens);
+  const uniqueTokenRatio =
+    params.tokenList.length > 0 ? params.entry.tokens.size / params.tokenList.length : 0;
+  const entropy = tokenEntropy(params.tokenList);
+
+  let score = 0.55 * lexicalDistance + 0.45 * novelty;
+  if (uniqueTokenRatio < params.cfg.minUniqueTokenRatio) {
+    score -= (params.cfg.minUniqueTokenRatio - uniqueTokenRatio) * 0.4;
+  }
+  if (params.tokenList.length <= params.cfg.shortMessageTokenLimit && entropy < params.cfg.minSignalEntropy) {
+    score -= (params.cfg.minSignalEntropy - entropy) * 0.06;
+  }
+
+  return {
+    score: Math.max(0, Math.min(1, score)),
+    novelty,
+    lexicalDistance,
+    uniqueTokenRatio,
+    entropy,
+  };
+}
+
+function shouldRequestEmbedding(params: {
+  cfg: ResolvedConfig;
+  backendAvailable: boolean;
+  lexical: LexicalFeatures;
+  warmup: boolean;
+  cooldownActive: boolean;
+}): boolean {
+  if (!params.backendAvailable || params.warmup || params.cooldownActive) {
+    return false;
+  }
+  if (params.lexical.score >= params.cfg.softScoreThreshold - params.cfg.embeddingTriggerMargin) {
+    return true;
+  }
+  return (
+    params.lexical.novelty >= params.cfg.softNoveltyThreshold * 0.9 &&
+    params.lexical.lexicalDistance >= 0.35
+  );
+}
+
 function classifyMessage(params: {
   cfg: ResolvedConfig;
   state: SessionState;
-  entry: HistoryEntry;
+  baselineTokenCount: number;
+  lexical: LexicalFeatures;
+  similarity?: number;
+  usedEmbedding: boolean;
   now: number;
 }): ClassificationDecision {
-  const { cfg, state, entry, now } = params;
-  const baselineEntries = state.history;
-  const baselineTokens = unionTokens(baselineEntries);
-
-  const lexicalSimilarity = jaccardSimilarity(entry.tokens, baselineTokens);
-  const lexicalDistance = 1 - lexicalSimilarity;
-  const novelty = noveltyRatio(entry.tokens, baselineTokens);
-
-  const baseVectors = baselineEntries
-    .map((item) => item.embedding)
-    .filter((vector): vector is number[] => Array.isArray(vector) && vector.length > 0);
-  const baseCentroid = centroid(baseVectors);
-  const similarity =
-    entry.embedding && baseCentroid ? cosineSimilarity(entry.embedding, baseCentroid) : undefined;
-  const usedEmbedding = typeof similarity === "number";
-
-  const score = usedEmbedding
-    ? 0.7 * (1 - similarity) + 0.15 * lexicalDistance + 0.15 * novelty
-    : 0.55 * lexicalDistance + 0.45 * novelty;
+  const { cfg, state, now } = params;
+  const score =
+    params.usedEmbedding && typeof params.similarity === "number"
+      ? 0.7 * (1 - params.similarity) +
+        0.15 * params.lexical.lexicalDistance +
+        0.15 * params.lexical.novelty
+      : params.lexical.score;
 
   const metrics = {
     score,
-    novelty,
-    lexicalDistance,
-    similarity,
-    usedEmbedding,
+    novelty: params.lexical.novelty,
+    lexicalDistance: params.lexical.lexicalDistance,
+    uniqueTokenRatio: params.lexical.uniqueTokenRatio,
+    entropy: params.lexical.entropy,
+    similarity: params.similarity,
+    usedEmbedding: params.usedEmbedding,
     pendingSoftSignals: state.pendingSoftSignals,
   } satisfies ClassifierMetrics;
 
-  if (
-    baselineEntries.length < cfg.minHistoryMessages ||
-    baselineTokens.size < cfg.minMeaningfulTokens
-  ) {
+  if (state.history.length < cfg.minHistoryMessages || params.baselineTokenCount < cfg.minMeaningfulTokens) {
     return { kind: "warmup", metrics, reason: "warmup" };
   }
 
@@ -814,8 +1030,11 @@ function classifyMessage(params: {
 
   const hardSignal =
     score >= cfg.hardScoreThreshold ||
-    ((typeof similarity === "number" ? similarity <= cfg.hardSimilarityThreshold : false) &&
-      novelty >= cfg.hardNoveltyThreshold);
+    (params.usedEmbedding && typeof params.similarity === "number"
+      ? params.similarity <= cfg.hardSimilarityThreshold &&
+        params.lexical.novelty >= cfg.hardNoveltyThreshold
+      : params.lexical.novelty >= cfg.hardNoveltyThreshold &&
+        params.lexical.lexicalDistance >= 0.65);
 
   if (hardSignal) {
     return { kind: "rotate-hard", metrics, reason: "hard-threshold" };
@@ -823,9 +1042,11 @@ function classifyMessage(params: {
 
   const softSignal =
     score >= cfg.softScoreThreshold ||
-    ((typeof similarity === "number" ? similarity <= cfg.softSimilarityThreshold : false) &&
-      novelty >= cfg.softNoveltyThreshold) ||
-    (!usedEmbedding && novelty >= cfg.softNoveltyThreshold && lexicalDistance >= 0.45);
+    (params.usedEmbedding && typeof params.similarity === "number"
+      ? params.similarity <= cfg.softSimilarityThreshold &&
+        params.lexical.novelty >= cfg.softNoveltyThreshold
+      : params.lexical.novelty >= cfg.softNoveltyThreshold &&
+        params.lexical.lexicalDistance >= 0.45);
 
   if (!softSignal) {
     return { kind: "stable", metrics, reason: "stable" };
@@ -885,15 +1106,10 @@ function resolveSessionFilePathFromEntry(params: {
   return path.resolve(sessionsDir, `${sessionId}.jsonl`);
 }
 
-async function readTranscriptTail(params: {
-  sessionFile: string;
-  takeLast: number;
-}): Promise<TranscriptMessage[]> {
-  const raw = await fs.readFile(params.sessionFile, "utf-8");
-  const lines = raw.split("\n");
+function parseTranscriptTailLines(lines: string[], takeLast: number): TranscriptMessage[] {
   const messages: TranscriptMessage[] = [];
-
-  for (const line of lines) {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i] ?? "";
     const trimmed = line.trim();
     if (!trimmed) {
       continue;
@@ -924,12 +1140,67 @@ async function readTranscriptTail(params: {
       continue;
     }
     messages.push({ role, text });
+    if (messages.length >= takeLast) {
+      break;
+    }
+  }
+  messages.reverse();
+  return messages;
+}
+
+async function readTranscriptTail(params: {
+  sessionFile: string;
+  takeLast: number;
+  maxBytes: number;
+  onFallbackFullRead?: () => void;
+}): Promise<TranscriptMessage[]> {
+  const fd = await fs.open(params.sessionFile, "r");
+  let fallbackFullRead = false;
+  try {
+    const stat = await fd.stat();
+    if (stat.size <= 0) {
+      return [];
+    }
+
+    let position = stat.size;
+    let bytesReadTotal = 0;
+    const chunks: string[] = [];
+    while (position > 0 && bytesReadTotal < params.maxBytes) {
+      const remainingBudget = params.maxBytes - bytesReadTotal;
+      const toRead = Math.min(64 * 1024, position, remainingBudget);
+      if (toRead <= 0) {
+        break;
+      }
+      const nextPosition = position - toRead;
+      const buffer = Buffer.allocUnsafe(toRead);
+      const result = await fd.read(buffer, 0, toRead, nextPosition);
+      if (result.bytesRead <= 0) {
+        break;
+      }
+      chunks.unshift(buffer.subarray(0, result.bytesRead).toString("utf-8"));
+      position = nextPosition;
+      bytesReadTotal += result.bytesRead;
+      if (chunks.join("").split("\n").length > params.takeLast * 30) {
+        break;
+      }
+    }
+
+    const tail = parseTranscriptTailLines(chunks.join("").split("\n"), params.takeLast);
+    if (tail.length >= params.takeLast || bytesReadTotal >= stat.size) {
+      return tail;
+    }
+    fallbackFullRead = true;
+  } finally {
+    await fd.close();
   }
 
-  if (messages.length <= params.takeLast) {
-    return messages;
+  if (!fallbackFullRead) {
+    return [];
   }
-  return messages.slice(messages.length - params.takeLast);
+
+  params.onFallbackFullRead?.();
+  const raw = await fs.readFile(params.sessionFile, "utf-8");
+  return parseTranscriptTailLines(raw.split("\n"), params.takeLast);
 }
 
 function truncateText(text: string, maxChars: number): string {
@@ -968,7 +1239,7 @@ async function buildHandoffEventFromPreviousSession(params: {
   previousEntry?: SessionEntryLike;
   logger: OpenClawPluginApi["logger"];
 }): Promise<string | null> {
-  if (params.cfg.handoffMode === "none") {
+  if (params.cfg.handoff.mode === "none") {
     return null;
   }
   const sessionFile = resolveSessionFilePathFromEntry({
@@ -982,12 +1253,18 @@ async function buildHandoffEventFromPreviousSession(params: {
   try {
     const tail = await readTranscriptTail({
       sessionFile,
-      takeLast: params.cfg.handoffLastN,
+      takeLast: params.cfg.handoff.lastN,
+      maxBytes: params.cfg.handoffTailReadMaxBytes,
+      onFallbackFullRead: () => {
+        params.logger.warn(
+          `topic-shift-reset: handoff tail fallback full-read file=${sessionFile}`,
+        );
+      },
     });
     return formatHandoffEventText({
-      mode: params.cfg.handoffMode,
+      mode: params.cfg.handoff.mode,
       messages: tail,
-      maxChars: params.cfg.handoffMaxChars,
+      maxChars: params.cfg.handoff.maxChars,
     });
   } catch (error) {
     params.logger.warn(
@@ -1054,13 +1331,9 @@ async function rotateSessionEntry(params: {
   });
 
   if (params.cfg.dryRun) {
-    params.state.lastResetAt = Date.now();
-    params.state.pendingSoftSignals = 0;
-    params.state.pendingEntries = [];
-    params.state.history = trimHistory([params.entry], params.cfg.historyWindow);
     params.api.logger.info(
       [
-        `topic-shift-reset: dry-run rotate`,
+        `topic-shift-reset: would-rotate`,
         `source=${params.source}`,
         `reason=${params.reason}`,
         `session=${params.sessionKey}`,
@@ -1129,8 +1402,9 @@ async function rotateSessionEntry(params: {
   params.state.pendingSoftSignals = 0;
   params.state.pendingEntries = [];
   params.state.history = trimHistory([params.entry], params.cfg.historyWindow);
+  seedTopicCentroid(params.state, params.entry.embedding);
 
-  params.api.logger.warn(
+  params.api.logger.info(
     [
       `topic-shift-reset: rotated`,
       `source=${params.source}`,
@@ -1164,7 +1438,7 @@ export default function register(api: OpenClawPluginApi): void {
   if (embeddingInitError) {
     api.logger.warn(`topic-shift-reset: embedding backend init failed: ${embeddingInitError}`);
   } else if (!embeddingBackend) {
-    api.logger.warn("topic-shift-reset: embedding backend unavailable, using lexical-only mode");
+    api.logger.info("topic-shift-reset: embedding backend unavailable, using lexical-only mode");
   } else {
     api.logger.info(`topic-shift-reset: embedding backend ${embeddingBackend.name}`);
   }
@@ -1175,7 +1449,6 @@ export default function register(api: OpenClawPluginApi): void {
     text: string;
     messageProvider?: string;
     agentId?: string;
-    dedupeKey?: string;
   }) => {
     if (!cfg.enabled) {
       return;
@@ -1185,24 +1458,19 @@ export default function register(api: OpenClawPluginApi): void {
       return;
     }
 
-    const provider = params.messageProvider?.trim().toLowerCase();
+    const provider = normalizeProviderId(params.messageProvider ?? "");
     if (provider && cfg.ignoredProviders.has(provider)) {
       return;
     }
 
     const rawText = params.text.trim();
-    const text = cfg.stripEnvelope ? stripClassifierEnvelope(rawText) : rawText;
+    const text = cfg.stripEnvelope ? stripClassifierEnvelope(rawText, cfg.stripRules) : rawText;
     if (!text || text.startsWith("/")) {
       return;
     }
 
     const tokenList = tokenizeList(text, cfg.minTokenLength);
-    const signalEntropy = tokenEntropy(tokenList);
-    if (
-      text.length < cfg.minSignalChars ||
-      tokenList.length < cfg.minSignalTokenCount ||
-      signalEntropy < cfg.minSignalEntropy
-    ) {
+    if (text.length < cfg.minSignalChars || tokenList.length < cfg.minSignalTokenCount) {
       if (cfg.debug) {
         api.logger.info(
           [
@@ -1211,7 +1479,6 @@ export default function register(api: OpenClawPluginApi): void {
             `session=${sessionKey}`,
             `chars=${text.length}`,
             `tokens=${tokenList.length}`,
-            `entropy=${signalEntropy.toFixed(3)}`,
           ].join(" "),
         );
       }
@@ -1219,26 +1486,11 @@ export default function register(api: OpenClawPluginApi): void {
     }
 
     const tokens = new Set(tokenList);
-    if (tokens.size < cfg.minMeaningfulTokens) {
-      return;
-    }
 
     const contentHash = hashString(normalizeTextForHash(text));
     const lastRotationAt = recentRotationBySession.get(`${sessionKey}:${contentHash}`);
     if (typeof lastRotationAt === "number" && Date.now() - lastRotationAt < ROTATION_DEDUPE_MS) {
       return;
-    }
-
-    let embedding: number[] | undefined;
-    if (embeddingBackend) {
-      try {
-        const vector = await embeddingBackend.embed(text);
-        if (Array.isArray(vector) && vector.length > 0) {
-          embedding = vector;
-        }
-      } catch (error) {
-        api.logger.warn(`topic-shift-reset: embeddings error backend=${embeddingBackend.name} err=${String(error)}`);
-      }
     }
 
     const now = Date.now();
@@ -1249,12 +1501,61 @@ export default function register(api: OpenClawPluginApi): void {
         pendingSoftSignals: 0,
         pendingEntries: [],
         lastResetAt: undefined,
+        topicCentroid: undefined,
+        topicCount: 0,
+        topicDim: undefined,
         lastSeenAt: now,
       } satisfies SessionState);
     state.lastSeenAt = now;
 
+    const baselineTokens = unionTokens(state.history);
+    const lexical = computeLexicalFeatures({
+      cfg,
+      entry: { tokens, at: now },
+      tokenList,
+      baselineTokens,
+    });
+    const warmup =
+      state.history.length < cfg.minHistoryMessages || baselineTokens.size < cfg.minMeaningfulTokens;
+    const cooldownMs = cfg.cooldownMinutes * 60_000;
+    const cooldownActive =
+      cooldownMs > 0 && typeof state.lastResetAt === "number" && now - state.lastResetAt < cooldownMs;
+
+    let embedding: number[] | undefined;
+    if (
+      shouldRequestEmbedding({
+        cfg,
+        backendAvailable: !!embeddingBackend,
+        lexical,
+        warmup,
+        cooldownActive,
+      }) &&
+      embeddingBackend
+    ) {
+      try {
+        const vector = await embeddingBackend.embed(text);
+        if (Array.isArray(vector) && vector.length > 0) {
+          embedding = vector;
+        }
+      } catch (error) {
+        api.logger.warn(`topic-shift-reset: embeddings error backend=${embeddingBackend.name} err=${String(error)}`);
+      }
+    }
+
     const entry: HistoryEntry = { tokens, embedding, at: now };
-    const decision = classifyMessage({ cfg, state, entry, now });
+    const similarity =
+      entry.embedding && state.topicCentroid
+        ? cosineSimilarity(entry.embedding, state.topicCentroid)
+        : undefined;
+    const decision = classifyMessage({
+      cfg,
+      state,
+      baselineTokenCount: baselineTokens.size,
+      lexical,
+      similarity,
+      usedEmbedding: typeof similarity === "number",
+      now,
+    });
 
     if (cfg.debug) {
       api.logger.info(
@@ -1267,6 +1568,8 @@ export default function register(api: OpenClawPluginApi): void {
           `score=${decision.metrics.score.toFixed(3)}`,
           `novelty=${decision.metrics.novelty.toFixed(3)}`,
           `lex=${decision.metrics.lexicalDistance.toFixed(3)}`,
+          `uniq=${decision.metrics.uniqueTokenRatio.toFixed(3)}`,
+          `entropy=${decision.metrics.entropy.toFixed(3)}`,
           `sim=${typeof decision.metrics.similarity === "number" ? decision.metrics.similarity.toFixed(3) : "n/a"}`,
           `embed=${decision.metrics.usedEmbedding ? "1" : "0"}`,
           `pending=${state.pendingSoftSignals}`,
@@ -1278,6 +1581,7 @@ export default function register(api: OpenClawPluginApi): void {
       state.pendingSoftSignals = 0;
       state.pendingEntries = [];
       state.history = trimHistory([...state.history, entry], cfg.historyWindow);
+      updateTopicCentroid(state, entry.embedding);
       sessionState.set(sessionKey, state);
       pruneStateMaps(sessionState);
       return;
@@ -1285,6 +1589,9 @@ export default function register(api: OpenClawPluginApi): void {
 
     if (decision.kind === "stable") {
       const merged = [...state.history, ...state.pendingEntries, entry];
+      for (const item of [...state.pendingEntries, entry]) {
+        updateTopicCentroid(state, item.embedding);
+      }
       state.pendingSoftSignals = 0;
       state.pendingEntries = [];
       state.history = trimHistory(merged, cfg.historyWindow);
@@ -1318,7 +1625,9 @@ export default function register(api: OpenClawPluginApi): void {
     });
 
     if (rotated) {
-      recentRotationBySession.set(`${sessionKey}:${contentHash}`, Date.now());
+      if (!cfg.dryRun) {
+        recentRotationBySession.set(`${sessionKey}:${contentHash}`, Date.now());
+      }
     }
 
     sessionState.set(sessionKey, state);
@@ -1355,7 +1664,7 @@ export default function register(api: OpenClawPluginApi): void {
     recentFastEvents.set(fastEventKey, Date.now());
     pruneRecentMap(recentFastEvents, FAST_EVENT_TTL_MS, MAX_RECENT_FAST_EVENTS);
 
-    let resolved: ResolvedFastSession | null = null;
+    let resolvedSessionKey = "";
     try {
       const route = api.runtime.channel.routing.resolveAgentRoute({
         cfg: api.config,
@@ -1363,10 +1672,7 @@ export default function register(api: OpenClawPluginApi): void {
         accountId: ctx.accountId,
         peer,
       });
-      resolved = {
-        sessionKey: route.sessionKey,
-        routeKind: peer.kind,
-      };
+      resolvedSessionKey = route.sessionKey;
     } catch (error) {
       if (cfg.debug) {
         api.logger.info(
@@ -1378,10 +1684,9 @@ export default function register(api: OpenClawPluginApi): void {
 
     await classifyAndMaybeRotate({
       source: "fast",
-      sessionKey: resolved.sessionKey,
+      sessionKey: resolvedSessionKey,
       text,
       messageProvider: channelId,
-      dedupeKey: fastEventKey,
     });
   });
 

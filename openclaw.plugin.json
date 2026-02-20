@@ -15,15 +15,54 @@
         "enum": ["conservative", "balanced", "aggressive"],
         "default": "balanced"
       },
-      "embeddings": {
-        "type": "string",
-        "enum": ["auto", "none", "openai", "ollama"],
-        "default": "auto"
+      "embedding": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": ["auto", "none", "openai", "ollama"],
+            "default": "auto"
+          },
+          "model": {
+            "type": "string"
+          },
+          "baseUrl": {
+            "type": "string"
+          },
+          "apiKey": {
+            "type": "string"
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 30000,
+            "default": 7000
+          }
+        }
       },
       "handoff": {
-        "type": "string",
-        "enum": ["none", "summary", "verbatim"],
-        "default": "summary"
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["none", "summary", "verbatim_last_n"],
+            "default": "summary"
+          },
+          "lastN": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 6
+          },
+          "maxChars": {
+            "type": "integer",
+            "minimum": 60,
+            "maximum": 800,
+            "default": 220
+          }
+        }
       },
       "dryRun": {
         "type": "boolean",
@@ -79,9 +118,60 @@
             "maximum": 8,
             "default": 1.2
           },
+          "minUniqueTokenRatio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.34
+          },
+          "shortMessageTokenLimit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 40,
+            "default": 6
+          },
+          "embeddingTriggerMargin": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.5,
+            "default": 0.08
+          },
           "stripEnvelope": {
             "type": "boolean",
             "default": true
+          },
+          "stripRules": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "dropLinePrefixPatterns": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "dropExactLines": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "dropFencedBlockAfterHeaderPatterns": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              }
+            }
+          },
+          "handoffTailReadMaxBytes": {
+            "type": "integer",
+            "minimum": 65536,
+            "maximum": 8388608,
+            "default": 524288
           },
           "softConsecutiveSignals": {
             "type": "integer",
@@ -137,52 +227,6 @@
               "type": "string"
             },
             "default": []
-          },
-          "handoff": {
-            "type": "string",
-            "enum": ["none", "summary", "verbatim", "verbatim_last_n"]
-          },
-          "handoffLastN": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 20,
-            "default": 6
-          },
-          "handoffMaxChars": {
-            "type": "integer",
-            "minimum": 60,
-            "maximum": 800,
-            "default": 220
-          },
-          "embeddings": {
-            "type": "string",
-            "enum": ["auto", "none", "openai", "ollama"]
-          },
-          "embedding": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "provider": {
-                "type": "string",
-                "enum": ["auto", "none", "openai", "ollama"],
-                "default": "auto"
-              },
-              "model": {
-                "type": "string"
-              },
-              "baseUrl": {
-                "type": "string"
-              },
-              "apiKey": {
-                "type": "string"
-              },
-              "timeoutMs": {
-                "type": "integer",
-                "minimum": 1000,
-                "maximum": 30000,
-                "default": 7000
-              }
-            }
           }
         }
       }
@@ -193,13 +237,13 @@
       "label": "Behavior Preset",
       "help": "conservative = fewer resets, balanced = default, aggressive = faster resets."
     },
-    "embeddings": {
-      "label": "Embeddings",
-      "help": "auto uses whichever embedding backend your instance already has configured."
+    "embedding": {
+      "label": "Embedding Backend",
+      "help": "Set one provider config for embeddings used by this plugin."
     },
     "handoff": {
       "label": "Context Handoff",
-      "help": "summary keeps transitions transparent without copying full transcript."
+      "help": "mode=summary is the safest default; verbatim_last_n copies recent transcript lines."
     },
     "dryRun": {
       "label": "Dry Run",

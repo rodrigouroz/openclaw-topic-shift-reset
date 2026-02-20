@@ -1,15 +1,22 @@
 # Configuration
 
-## Recommended public config
+## Canonical public config
 
-Use this minimal config for normal users:
+This plugin now accepts one canonical key per concept:
 
 ```json
 {
   "enabled": true,
   "preset": "balanced",
-  "embeddings": "auto",
-  "handoff": "summary",
+  "embedding": {
+    "provider": "auto",
+    "timeoutMs": 7000
+  },
+  "handoff": {
+    "mode": "summary",
+    "lastN": 6,
+    "maxChars": 220
+  },
   "dryRun": false,
   "debug": false
 }
@@ -17,16 +24,20 @@ Use this minimal config for normal users:
 
 ## Public options
 
-- `enabled`: turn plugin behavior on/off.
+- `enabled`: plugin on/off.
 - `preset`: `conservative | balanced | aggressive`.
-- `embeddings`: `auto | openai | ollama | none`.
-- `handoff`: `none | summary | verbatim`.
-- `dryRun`: if `true`, logs decisions but never rotates sessions.
-- `debug`: if `true`, emits per-message metrics logs.
+- `embedding.provider`: `auto | openai | ollama | none`.
+- `embedding.model`: optional model override for selected provider.
+- `embedding.baseUrl`: optional provider base URL override.
+- `embedding.apiKey`: optional explicit API key override.
+- `embedding.timeoutMs`: embedding request timeout.
+- `handoff.mode`: `none | summary | verbatim_last_n`.
+- `handoff.lastN`: number of transcript messages to include in handoff.
+- `handoff.maxChars`: per-message truncation cap in handoff text.
+- `dryRun`: logs would-rotate events without session resets.
+- `debug`: emits per-message classifier diagnostics.
 
-## Built-in presets defaults
-
-`preset` controls the classifier layer. These are the built-in defaults:
+## Built-in preset defaults
 
 | Key | conservative | balanced (default) | aggressive |
 | --- | --- | --- | --- |
@@ -45,41 +56,34 @@ Use this minimal config for normal users:
 
 ## Shared defaults
 
-These defaults apply in all presets unless overridden:
-
-- `handoff`: `summary`
-- `handoffLastN`: `6`
-- `handoffMaxChars`: `220`
-- `embeddings`: `auto`
+- `embedding.provider`: `auto`
 - `embedding.timeoutMs`: `7000`
-- `minSignalChars`: `20`
-- `minSignalTokenCount`: `3`
-- `minSignalEntropy`: `1.2`
-- `stripEnvelope`: `true`
+- `handoff.mode`: `summary`
+- `handoff.lastN`: `6`
+- `handoff.maxChars`: `220`
+- `advanced.minSignalChars`: `20`
+- `advanced.minSignalTokenCount`: `3`
+- `advanced.minSignalEntropy`: `1.2`
+- `advanced.minUniqueTokenRatio`: `0.34`
+- `advanced.shortMessageTokenLimit`: `6`
+- `advanced.embeddingTriggerMargin`: `0.08`
+- `advanced.stripEnvelope`: `true`
+- `advanced.handoffTailReadMaxBytes`: `524288`
 
 ## Advanced overrides
 
-The runtime resolves config in this order:
-
-1. Built-in preset defaults.
-2. Shared defaults.
-3. `advanced` overrides (only the keys you set).
-
-Power users can override behavior via `advanced`:
+Advanced keys let you override classifier internals and envelope stripping:
 
 ```json
 {
   "preset": "balanced",
   "advanced": {
     "cooldownMinutes": 3,
-    "minSignalEntropy": 1.4,
-    "softConsecutiveSignals": 2,
-    "softScoreThreshold": 0.7,
-    "hardScoreThreshold": 0.84,
-    "handoffLastN": 5,
-    "embedding": {
-      "model": "text-embedding-3-small",
-      "timeoutMs": 7000
+    "embeddingTriggerMargin": 0.1,
+    "minUniqueTokenRatio": 0.4,
+    "stripRules": {
+      "dropLinePrefixPatterns": ["^[A-Za-z][A-Za-z _-]{0,30}:\\s*\\["],
+      "dropFencedBlockAfterHeaderPatterns": ["^[A-Za-z][A-Za-z _-]{0,40}:\\s*\\([^)]*(metadata|context)[^)]*\\):?$"]
     }
   }
 }
@@ -94,7 +98,14 @@ Advanced keys:
 - `minSignalChars`
 - `minSignalTokenCount`
 - `minSignalEntropy`
+- `minUniqueTokenRatio`
+- `shortMessageTokenLimit`
+- `embeddingTriggerMargin`
 - `stripEnvelope`
+- `stripRules.dropLinePrefixPatterns`
+- `stripRules.dropExactLines`
+- `stripRules.dropFencedBlockAfterHeaderPatterns`
+- `handoffTailReadMaxBytes`
 - `softConsecutiveSignals`
 - `cooldownMinutes`
 - `softScoreThreshold`
@@ -104,20 +115,21 @@ Advanced keys:
 - `softNoveltyThreshold`
 - `hardNoveltyThreshold`
 - `ignoredProviders`
-- `handoff`
-- `handoffLastN`
-- `handoffMaxChars`
-- `embeddings`
-- `embedding.provider`
-- `embedding.model`
-- `embedding.baseUrl`
-- `embedding.apiKey`
-- `embedding.timeoutMs`
 
-Notes:
+`ignoredProviders` expects canonical provider IDs:
 
-- Top-level public keys stay minimal: `enabled`, `preset`, `embeddings`, `handoff`, `dryRun`, `debug`.
-- Tuning keys outside `advanced` are rejected by config schema validation.
+- `telegram`, `whatsapp`, `signal`, `discord`, `slack`, `matrix`, `msteams`, `imessage`, `web`, `voice`
+- model/provider IDs like `openai`, `anthropic`, `ollama` (for fallback hook contexts)
+
+## Migration note
+
+Legacy alias keys are not supported in this release. Config validation fails if you use old keys such as:
+
+- `embeddings` (top-level)
+- string `handoff` values (top-level)
+- `handoffMode`, `handoffLastN`, `handoffMaxChars`
+- `advanced.embedding`, `advanced.embeddings`, `advanced.handoff*`
+- previous top-level tuning keys
 
 ## Log interpretation
 
@@ -133,17 +145,8 @@ Kinds:
 - `rotate-hard`: immediate reset trigger.
 - `rotate-soft`: soft signal confirmed.
 
-Reasons:
-
-- `warmup`
-- `stable`
-- `cooldown`
-- `skip-low-signal`
-- `soft-suspect`
-- `soft-confirmed`
-- `hard-threshold`
-
 Other lines:
 
-- `dry-run rotate`: would have rotated, but `dryRun=true`.
+- `skip-low-signal`: message skipped by hard signal floor (`minSignalChars`/`minSignalTokenCount`).
+- `would-rotate`: `dryRun=true` synthetic rotate event (no reset mutation).
 - `rotated`: actual session rotation happened.
