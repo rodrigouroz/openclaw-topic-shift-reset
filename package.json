@@ -1,6 +1,6 @@
 {
   "name": "openclaw-topic-shift-reset",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenClaw plugin that detects topic shifts and starts a fresh session automatically.",
   "type": "module",
   "main": "./src/index.ts",
