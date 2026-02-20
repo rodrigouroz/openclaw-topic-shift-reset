@@ -13,7 +13,6 @@ Most users should only set these fields:
       "openclaw-topic-shift-reset": {
         "enabled": true,
         "config": {
-          "enabled": true,
           "preset": "balanced",
           "embeddings": "auto",
           "handoff": "summary",
