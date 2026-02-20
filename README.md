@@ -60,15 +60,37 @@ Default preset internals:
 - `ollama`
 - `none` (lexical only)
 
-## Install locally
+## Install
 
 ```bash
-openclaw plugins install --link ~/Projects/openclaw-topic-shift-reset
+openclaw plugins install openclaw-topic-shift-reset
 openclaw plugins enable openclaw-topic-shift-reset
 openclaw plugins info openclaw-topic-shift-reset
 ```
 
-Restart gateway after install/config changes.
+Add this plugin entry in `~/.openclaw/openclaw.json` (or merge into your existing config):
+
+```json
+{
+  "plugins": {
+    "allow": ["openclaw-topic-shift-reset"],
+    "entries": {
+      "openclaw-topic-shift-reset": {
+        "enabled": true,
+        "config": {
+          "preset": "balanced",
+          "embeddings": "auto",
+          "handoff": "summary",
+          "dryRun": false,
+          "debug": false
+        }
+      }
+    }
+  }
+}
+```
+
+Restart gateway after install/config changes. After restart, `openclaw plugins info openclaw-topic-shift-reset` should show `Status: loaded`.
 
 ## Logs
 
@@ -102,14 +124,6 @@ This skips classification for very short/low-information messages (for example `
 ## Local development
 
 No build step is required. OpenClaw loads `src/index.ts` via jiti.
-
-## Publish
-
-```bash
-cd ~/Projects/openclaw-topic-shift-reset
-npm publish
-npm view openclaw-topic-shift-reset version --userconfig "$(mktemp)"
-```
 
 ## Known tradeoff (plugin-only)
 
