@@ -64,6 +64,27 @@
           }
         }
       },
+      "softSuspect": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["none", "ask"],
+            "default": "ask"
+          },
+          "prompt": {
+            "type": "string",
+            "default": "Potential topic shift detected. Ask one short clarification question to confirm the user's new goal before proceeding."
+          },
+          "ttlSeconds": {
+            "type": "integer",
+            "minimum": 10,
+            "maximum": 1800,
+            "default": 120
+          }
+        }
+      },
       "dryRun": {
         "type": "boolean",
         "default": false
@@ -244,6 +265,10 @@
     "handoff": {
       "label": "Context Handoff",
       "help": "mode=summary is the safest default; verbatim_last_n copies recent transcript lines."
+    },
+    "softSuspect": {
+      "label": "Soft-Suspect Clarification",
+      "help": "When a soft topic-shift signal appears, optionally steer the model to ask one clarification question before proceeding."
     },
     "dryRun": {
       "label": "Dry Run",
