@@ -19,6 +19,7 @@ This plugin now accepts one canonical key per concept:
   },
   "softSuspect": {
     "action": "ask",
+    "mode": "strict",
     "ttlSeconds": 120
   },
   "dryRun": false,
@@ -29,6 +30,7 @@ This plugin now accepts one canonical key per concept:
 ## Public options
 
 Classifier inputs are limited to inbound user message text and successful outbound agent message text.
+With `softSuspect.mode: "strict"` (default), a soft-confirm reset is blocked until a clarification steer is injected and a subsequent user reply is observed.
 
 - `enabled`: plugin on/off.
 - `preset`: `conservative | balanced | aggressive`.
@@ -41,6 +43,7 @@ Classifier inputs are limited to inbound user message text and successful outbou
 - `handoff.lastN`: number of transcript messages to include in handoff.
 - `handoff.maxChars`: per-message truncation cap in handoff text.
 - `softSuspect.action`: `ask | none`.
+- `softSuspect.mode`: `strict | best_effort`.
 - `softSuspect.prompt`: optional steer text injected on soft-suspect.
 - `softSuspect.ttlSeconds`: expiry for pending soft-suspect steer.
 - `dryRun`: logs would-rotate events without session resets.
@@ -71,6 +74,7 @@ Classifier inputs are limited to inbound user message text and successful outbou
 - `handoff.lastN`: `6`
 - `handoff.maxChars`: `220`
 - `softSuspect.action`: `ask`
+- `softSuspect.mode`: `strict`
 - `softSuspect.ttlSeconds`: `120`
 - `advanced.minSignalChars`: `20`
 - `advanced.minSignalTokenCount`: `3`

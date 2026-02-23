@@ -12,6 +12,7 @@ type PresetName = "conservative" | "balanced" | "aggressive";
 type EmbeddingProvider = "auto" | "none" | "openai" | "ollama";
 type HandoffMode = "none" | "summary" | "verbatim_last_n";
 type SoftSuspectAction = "none" | "ask";
+type SoftSuspectMode = "best_effort" | "strict";
 
 type EmbeddingConfig = {
   provider?: EmbeddingProvider;
@@ -29,6 +30,7 @@ type HandoffConfig = {
 
 type SoftSuspectConfig = {
   action?: SoftSuspectAction;
+  mode?: SoftSuspectMode;
   prompt?: string;
   ttlSeconds?: number;
 };
@@ -110,6 +112,7 @@ type ResolvedConfig = {
   };
   softSuspect: {
     action: SoftSuspectAction;
+    mode: SoftSuspectMode;
     prompt: string;
     ttlMs: number;
   };
@@ -285,6 +288,7 @@ const DEFAULTS = {
   handoffLastN: 6,
   handoffMaxChars: 220,
   softSuspectAction: "ask" as SoftSuspectAction,
+  softSuspectMode: "strict" as SoftSuspectMode,
   softSuspectPrompt:
     "Potential topic shift detected. Ask one short clarification question to confirm the user's new goal before proceeding.",
   softSuspectTtlSeconds: 120,
@@ -406,6 +410,17 @@ function normalizeSoftSuspectAction(value: unknown): SoftSuspectAction {
     return normalized;
   }
   return DEFAULTS.softSuspectAction;
+}
+
+function normalizeSoftSuspectMode(value: unknown): SoftSuspectMode {
+  if (typeof value !== "string") {
+    return DEFAULTS.softSuspectMode;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "best_effort" || normalized === "strict") {
+    return normalized;
+  }
+  return DEFAULTS.softSuspectMode;
 }
 
 function compileRegexList(values: unknown, fallback: readonly string[]): RegExp[] {
@@ -790,6 +805,7 @@ function resolveConfig(raw: unknown): ResolvedConfig {
     },
     softSuspect: {
       action: normalizeSoftSuspectAction(softSuspect.action),
+      mode: normalizeSoftSuspectMode(softSuspect.mode),
       prompt:
         typeof softSuspect.prompt === "string" && softSuspect.prompt.trim()
           ? softSuspect.prompt.trim()
@@ -1671,7 +1687,13 @@ export default function register(api: OpenClawPluginApi): void {
   const recentAgentEvents = new Map<string, number>();
   const recentRotationBySession = new Map<string, number>();
   const pendingSoftSuspectSteeringBySession = new Map<string, number>();
+  const awaitingSoftSuspectReplyBySession = new Map<string, number>();
   const sessionWorkQueue = new Map<string, Promise<unknown>>();
+
+  const clearSoftSuspectSteerState = (sessionKey: string) => {
+    pendingSoftSuspectSteeringBySession.delete(sessionKey);
+    awaitingSoftSuspectReplyBySession.delete(sessionKey);
+  };
 
   const persistencePath = (() => {
     try {
@@ -1914,8 +1936,9 @@ export default function register(api: OpenClawPluginApi): void {
     }
 
     const tokens = new Set(tokenList);
-
     const now = Date.now();
+    const entry: HistoryEntry = { tokens, at: now };
+
     const contentHash = hashString(normalizeTextForHash(text));
     const lastRotationAt = recentRotationBySession.get(`${sessionKey}:${contentHash}`);
     if (typeof lastRotationAt === "number" && now - lastRotationAt < ROTATION_DEDUPE_MS) {
@@ -1935,10 +1958,41 @@ export default function register(api: OpenClawPluginApi): void {
       } satisfies SessionState);
     state.lastSeenAt = now;
 
+    if (params.source === "agent") {
+      // Outbound agent text helps keep topic context fresh, but it should not
+      // advance soft-suspect confirmation state by itself.
+      state.history = trimHistory([...state.history, entry], cfg.historyWindow);
+      updateTopicCentroid(state, entry.embedding);
+      sessionState.set(sessionKey, state);
+      pruneStateMaps(sessionState);
+      schedulePersistentFlush(false);
+      return;
+    }
+
+    const pendingSoftSteerAt = pendingSoftSuspectSteeringBySession.get(sessionKey);
+    const pendingSoftSteerActive =
+      typeof pendingSoftSteerAt === "number" && now - pendingSoftSteerAt <= cfg.softSuspect.ttlMs;
+    if (typeof pendingSoftSteerAt === "number" && !pendingSoftSteerActive) {
+      pendingSoftSuspectSteeringBySession.delete(sessionKey);
+    }
+
+    const awaitingSoftReplyAt = awaitingSoftSuspectReplyBySession.get(sessionKey);
+    const awaitingSoftReplyActive =
+      typeof awaitingSoftReplyAt === "number" && now - awaitingSoftReplyAt <= cfg.softSuspect.ttlMs;
+    if (typeof awaitingSoftReplyAt === "number" && !awaitingSoftReplyActive) {
+      awaitingSoftSuspectReplyBySession.delete(sessionKey);
+    }
+    if (awaitingSoftReplyActive) {
+      awaitingSoftSuspectReplyBySession.delete(sessionKey);
+      if (cfg.debug) {
+        api.logger.debug(`topic-shift-reset: ask-resolved user-reply session=${sessionKey}`);
+      }
+    }
+
     const baselineTokens = unionTokens(state.history);
     const lexical = computeLexicalFeatures({
       cfg,
-      entry: { tokens, at: now },
+      entry,
       tokenList,
       baselineTokens,
     });
@@ -1969,12 +2023,14 @@ export default function register(api: OpenClawPluginApi): void {
       }
     }
 
-    const entry: HistoryEntry = { tokens, embedding, at: now };
+    if (Array.isArray(embedding) && embedding.length > 0) {
+      entry.embedding = embedding;
+    }
     const similarity =
       entry.embedding && state.topicCentroid
         ? cosineSimilarity(entry.embedding, state.topicCentroid)
         : undefined;
-    const decision = classifyMessage({
+    let decision = classifyMessage({
       cfg,
       state,
       baselineTokenCount: baselineTokens.size,
@@ -1983,6 +2039,22 @@ export default function register(api: OpenClawPluginApi): void {
       usedEmbedding: typeof similarity === "number",
       now,
     });
+
+    if (
+      cfg.softSuspect.action === "ask" &&
+      cfg.softSuspect.mode === "strict" &&
+      pendingSoftSteerActive &&
+      decision.kind === "rotate-soft"
+    ) {
+      if (cfg.debug) {
+        api.logger.debug(`topic-shift-reset: ask-blocked-waiting-injection session=${sessionKey}`);
+      }
+      decision = {
+        kind: "suspect",
+        reason: "soft-suspect-awaiting-ask",
+        metrics: decision.metrics,
+      };
+    }
 
     if (cfg.debug) {
       api.logger.debug(
@@ -2005,7 +2077,7 @@ export default function register(api: OpenClawPluginApi): void {
     }
 
     if (decision.kind === "warmup") {
-      pendingSoftSuspectSteeringBySession.delete(sessionKey);
+      clearSoftSuspectSteerState(sessionKey);
       state.pendingSoftSignals = 0;
       state.pendingEntries = [];
       state.history = trimHistory([...state.history, entry], cfg.historyWindow);
@@ -2017,7 +2089,7 @@ export default function register(api: OpenClawPluginApi): void {
     }
 
     if (decision.kind === "stable") {
-      pendingSoftSuspectSteeringBySession.delete(sessionKey);
+      clearSoftSuspectSteerState(sessionKey);
       const merged = [...state.history, ...state.pendingEntries, entry];
       for (const item of [...state.pendingEntries, entry]) {
         updateTopicCentroid(state, item.embedding);
@@ -2039,6 +2111,9 @@ export default function register(api: OpenClawPluginApi): void {
           Math.max(cfg.softSuspect.ttlMs * 2, 60_000),
           MAX_RECENT_MESSAGE_EVENTS,
         );
+        if (cfg.debug) {
+          api.logger.debug(`topic-shift-reset: suspect-queued session=${sessionKey}`);
+        }
       }
       state.pendingSoftSignals += 1;
       state.pendingEntries = trimHistory([...state.pendingEntries, entry], cfg.softConsecutiveSignals);
@@ -2065,7 +2140,7 @@ export default function register(api: OpenClawPluginApi): void {
     });
 
     if (rotated) {
-      pendingSoftSuspectSteeringBySession.delete(sessionKey);
+      clearSoftSuspectSteerState(sessionKey);
       if (!cfg.dryRun) {
         recentRotationBySession.set(`${sessionKey}:${contentHash}`, Date.now());
       }
@@ -2229,15 +2304,36 @@ export default function register(api: OpenClawPluginApi): void {
     if (!sessionKey) {
       return;
     }
+    const now = Date.now();
+    const awaitingAt = awaitingSoftSuspectReplyBySession.get(sessionKey);
+    if (typeof awaitingAt === "number") {
+      if (now - awaitingAt > cfg.softSuspect.ttlMs) {
+        awaitingSoftSuspectReplyBySession.delete(sessionKey);
+      }
+      return;
+    }
+
     const seenAt = pendingSoftSuspectSteeringBySession.get(sessionKey);
     if (typeof seenAt !== "number") {
       return;
     }
-    if (Date.now() - seenAt > cfg.softSuspect.ttlMs) {
+    if (now - seenAt > cfg.softSuspect.ttlMs) {
       pendingSoftSuspectSteeringBySession.delete(sessionKey);
       return;
     }
+
+    if (cfg.softSuspect.mode === "strict") {
+      awaitingSoftSuspectReplyBySession.set(sessionKey, now);
+      pruneRecentMap(
+        awaitingSoftSuspectReplyBySession,
+        Math.max(cfg.softSuspect.ttlMs * 2, 60_000),
+        MAX_RECENT_MESSAGE_EVENTS,
+      );
+    }
     pendingSoftSuspectSteeringBySession.delete(sessionKey);
+    if (cfg.debug) {
+      api.logger.debug(`topic-shift-reset: ask-injected session=${sessionKey}`);
+    }
     return { prependContext: cfg.softSuspect.prompt };
   });
 

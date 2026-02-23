@@ -47,6 +47,7 @@ Add this plugin entry in `~/.openclaw/openclaw.json` (or merge into your existin
           },
           "softSuspect": {
             "action": "ask",
+            "mode": "strict",
             "ttlSeconds": 120
           },
           "dryRun": false,
@@ -116,6 +117,7 @@ When the classifier sees a soft topic-shift signal (`suspect`) but not enough co
 {
   "softSuspect": {
     "action": "ask",
+    "mode": "strict",
     "prompt": "Potential topic shift detected. Ask one short clarification question to confirm the user's new goal before proceeding.",
     "ttlSeconds": 120
   }
@@ -123,6 +125,7 @@ When the classifier sees a soft topic-shift signal (`suspect`) but not enough co
 ```
 
 - `action`: `ask` (default) or `none`.
+- `mode`: `strict` (default, require clarification turn before soft-confirm reset) or `best_effort` (legacy timing-based behavior).
 - `prompt`: optional custom steer text.
 - `ttlSeconds`: max age before a pending steer expires.
 
@@ -153,6 +156,14 @@ All plugin logs are prefixed with `topic-shift-reset:`.
 
 - `classify source=<...> kind=<warmup|stable|suspect|rotate-hard|rotate-soft> reason=<...> ...`
   Full classifier output and metrics for a processed message.
+- `suspect-queued session=<...>`
+  Soft-suspect state queued for clarification steering.
+- `ask-injected session=<...>`
+  Clarification steer was injected into prompt build for this session.
+- `ask-resolved user-reply session=<...>`
+  A new user reply arrived after the injected clarification turn.
+- `ask-blocked-waiting-injection session=<...>`
+  Strict mode prevented soft-confirm reset until clarification steer is injected.
 - `skip-internal-provider source=<...> provider=<...> session=<...>`
   Skipped event from internal/non-user provider (for example cron/system paths).
 - `skip-low-signal source=<...> session=<...> chars=<n> tokens=<n>`

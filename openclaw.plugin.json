@@ -73,6 +73,11 @@
             "enum": ["none", "ask"],
             "default": "ask"
           },
+          "mode": {
+            "type": "string",
+            "enum": ["strict", "best_effort"],
+            "default": "strict"
+          },
           "prompt": {
             "type": "string",
             "default": "Potential topic shift detected. Ask one short clarification question to confirm the user's new goal before proceeding."
@@ -268,7 +273,7 @@
     },
     "softSuspect": {
       "label": "Soft-Suspect Clarification",
-      "help": "When a soft topic-shift signal appears, optionally steer the model to ask one clarification question before proceeding."
+      "help": "strict = require one clarification turn before soft-confirm reset. best_effort = steer when possible."
     },
     "dryRun": {
       "label": "Dry Run",

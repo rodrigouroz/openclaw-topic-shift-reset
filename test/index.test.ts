@@ -418,7 +418,7 @@ describe("openclaw-topic-shift-reset", () => {
     expect(apiBundle.hooks.has("message_sent")).toBe(true);
   });
 
-  it("classifies outbound agent text from message_sent and skips failed sends", async () => {
+  it("uses outbound agent text only for context updates and skips failed sends", async () => {
     const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "topic-shift-reset-double-count-"));
     const storePath = path.join(rootDir, "agents", "main", "sessions", "sessions.json");
     const sessionKey = "agent:main:main";
@@ -472,13 +472,13 @@ describe("openclaw-topic-shift-reset", () => {
       conversationId: "user-1",
     });
     await emitAgentMessage(apiBundle.hooks, {
-      text: "agent response that should trigger rotation",
+      text: "agent response that should not trigger rotation",
       to: "user-1",
       success: false,
       conversationId: "user-1",
     });
     await emitAgentMessage(apiBundle.hooks, {
-      text: "agent response that should trigger rotation",
+      text: "agent response that should not trigger rotation",
       to: "user-1",
       success: true,
       conversationId: "user-1",
@@ -486,7 +486,7 @@ describe("openclaw-topic-shift-reset", () => {
 
     const store = (await readJson(storePath)) as Record<string, { sessionId?: string }>;
     expect(store[sessionKey]?.sessionId).toBeTruthy();
-    expect(store[sessionKey]?.sessionId).not.toBe(initialSessionId);
+    expect(store[sessionKey]?.sessionId).toBe(initialSessionId);
   });
 
   it("ignores incompatible persisted state versions safely", async () => {
@@ -554,6 +554,7 @@ describe("openclaw-topic-shift-reset", () => {
         embedding: { provider: "none" },
         softSuspect: {
           action: "ask",
+          mode: "strict",
           prompt: "ASK_CLARIFY_ON_TOPIC_SHIFT",
           ttlSeconds: 120,
         },
@@ -641,6 +642,180 @@ describe("openclaw-topic-shift-reset", () => {
 
     const steer = await beforePromptBuild(
       { prompt: "alpha fresh topic with very different terms", messages: [] },
+      { sessionKey, messageProvider: "telegram", agentId: "main" },
+    );
+    expect(steer).toBeUndefined();
+  });
+
+  it("strict softSuspect blocks soft-confirm until ask is injected and user replies", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "topic-shift-reset-softsuspect-strict-"));
+    const storePath = path.join(rootDir, "agents", "main", "sessions", "sessions.json");
+    const sessionKey = "agent:main:main";
+    const initialSessionId = "main-initial-session";
+    await fs.mkdir(path.dirname(storePath), { recursive: true });
+    await fs.writeFile(
+      storePath,
+      JSON.stringify(
+        {
+          [sessionKey]: {
+            sessionId: initialSessionId,
+            updatedAt: Date.now(),
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const sdkState = createSdkMockState();
+    const register = await importRegisterWithSdkMock(sdkState);
+    const apiBundle = createTestApi({
+      stateDirResolver: () => {
+        throw new Error("disable persistence for this test");
+      },
+      pluginConfig: {
+        embedding: { provider: "none" },
+        softSuspect: {
+          action: "ask",
+          mode: "strict",
+          prompt: "ASK_CLARIFY_STRICT",
+          ttlSeconds: 120,
+        },
+        advanced: {
+          minHistoryMessages: 1,
+          minMeaningfulTokens: 1,
+          minSignalChars: 1,
+          minSignalTokenCount: 1,
+          softConsecutiveSignals: 2,
+          softScoreThreshold: 0,
+          softNoveltyThreshold: 0,
+          hardScoreThreshold: 1,
+          hardNoveltyThreshold: 1,
+        },
+      },
+      resolveStorePathImpl: () => storePath,
+      resolveRouteImpl: () => ({
+        sessionKey,
+        agentId: "main",
+      }),
+    });
+    register(apiBundle.api);
+
+    await emitUserMessage(apiBundle.hooks, {
+      text: "scan markets node baseline context",
+      conversationId: "user-1",
+    });
+    await emitUserMessage(apiBundle.hooks, {
+      text: "scan markets node refresh issue now",
+      conversationId: "user-1",
+    });
+    await emitUserMessage(apiBundle.hooks, {
+      text: "scan markets node still failing after retry",
+      conversationId: "user-1",
+    });
+
+    const storeAfterBlocked = (await readJson(storePath)) as Record<string, { sessionId?: string }>;
+    expect(storeAfterBlocked[sessionKey]?.sessionId).toBe(initialSessionId);
+
+    const beforePromptBuild = getHook(apiBundle.hooks, "before_prompt_build");
+    const steer = await beforePromptBuild(
+      { prompt: "prompt placeholder", messages: [] },
+      { sessionKey, messageProvider: "telegram", agentId: "main" },
+    );
+    expect(steer).toEqual({ prependContext: "ASK_CLARIFY_STRICT" });
+
+    const secondSteer = await beforePromptBuild(
+      { prompt: "prompt placeholder", messages: [] },
+      { sessionKey, messageProvider: "telegram", agentId: "main" },
+    );
+    expect(secondSteer).toBeUndefined();
+
+    await emitUserMessage(apiBundle.hooks, {
+      text: "user reply after clarification prompt",
+      conversationId: "user-1",
+    });
+
+    const storeAfterReply = (await readJson(storePath)) as Record<string, { sessionId?: string }>;
+    expect(storeAfterReply[sessionKey]?.sessionId).toBeTruthy();
+    expect(storeAfterReply[sessionKey]?.sessionId).not.toBe(initialSessionId);
+  });
+
+  it("best_effort softSuspect can soft-confirm before ask injection", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "topic-shift-reset-softsuspect-best-effort-"));
+    const storePath = path.join(rootDir, "agents", "main", "sessions", "sessions.json");
+    const sessionKey = "agent:main:main";
+    const initialSessionId = "main-initial-session";
+    await fs.mkdir(path.dirname(storePath), { recursive: true });
+    await fs.writeFile(
+      storePath,
+      JSON.stringify(
+        {
+          [sessionKey]: {
+            sessionId: initialSessionId,
+            updatedAt: Date.now(),
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const sdkState = createSdkMockState();
+    const register = await importRegisterWithSdkMock(sdkState);
+    const apiBundle = createTestApi({
+      stateDirResolver: () => {
+        throw new Error("disable persistence for this test");
+      },
+      pluginConfig: {
+        embedding: { provider: "none" },
+        softSuspect: {
+          action: "ask",
+          mode: "best_effort",
+          prompt: "ASK_CLARIFY_BEST_EFFORT",
+          ttlSeconds: 120,
+        },
+        advanced: {
+          minHistoryMessages: 1,
+          minMeaningfulTokens: 1,
+          minSignalChars: 1,
+          minSignalTokenCount: 1,
+          softConsecutiveSignals: 2,
+          softScoreThreshold: 0,
+          softNoveltyThreshold: 0,
+          hardScoreThreshold: 1,
+          hardNoveltyThreshold: 1,
+        },
+      },
+      resolveStorePathImpl: () => storePath,
+      resolveRouteImpl: () => ({
+        sessionKey,
+        agentId: "main",
+      }),
+    });
+    register(apiBundle.api);
+
+    await emitUserMessage(apiBundle.hooks, {
+      text: "scan markets node baseline context",
+      conversationId: "user-1",
+    });
+    await emitUserMessage(apiBundle.hooks, {
+      text: "scan markets node refresh issue now",
+      conversationId: "user-1",
+    });
+    await emitUserMessage(apiBundle.hooks, {
+      text: "scan markets node still failing after retry",
+      conversationId: "user-1",
+    });
+
+    const store = (await readJson(storePath)) as Record<string, { sessionId?: string }>;
+    expect(store[sessionKey]?.sessionId).toBeTruthy();
+    expect(store[sessionKey]?.sessionId).not.toBe(initialSessionId);
+
+    const beforePromptBuild = getHook(apiBundle.hooks, "before_prompt_build");
+    const steer = await beforePromptBuild(
+      { prompt: "prompt placeholder", messages: [] },
       { sessionKey, messageProvider: "telegram", agentId: "main" },
     );
     expect(steer).toBeUndefined();
