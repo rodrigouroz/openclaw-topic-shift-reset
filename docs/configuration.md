@@ -17,12 +17,18 @@ This plugin now accepts one canonical key per concept:
     "lastN": 6,
     "maxChars": 220
   },
+  "softSuspect": {
+    "action": "ask",
+    "ttlSeconds": 120
+  },
   "dryRun": false,
   "debug": false
 }
 ```
 
 ## Public options
+
+Classifier inputs are limited to inbound user message text and successful outbound agent message text.
 
 - `enabled`: plugin on/off.
 - `preset`: `conservative | balanced | aggressive`.
@@ -34,6 +40,9 @@ This plugin now accepts one canonical key per concept:
 - `handoff.mode`: `none | summary | verbatim_last_n`.
 - `handoff.lastN`: number of transcript messages to include in handoff.
 - `handoff.maxChars`: per-message truncation cap in handoff text.
+- `softSuspect.action`: `ask | none`.
+- `softSuspect.prompt`: optional steer text injected on soft-suspect.
+- `softSuspect.ttlSeconds`: expiry for pending soft-suspect steer.
 - `dryRun`: logs would-rotate events without session resets.
 - `debug`: emits per-message classifier diagnostics.
 
@@ -61,6 +70,8 @@ This plugin now accepts one canonical key per concept:
 - `handoff.mode`: `summary`
 - `handoff.lastN`: `6`
 - `handoff.maxChars`: `220`
+- `softSuspect.action`: `ask`
+- `softSuspect.ttlSeconds`: `120`
 - `advanced.minSignalChars`: `20`
 - `advanced.minSignalTokenCount`: `3`
 - `advanced.minSignalEntropy`: `1.2`
@@ -119,7 +130,7 @@ Advanced keys:
 `ignoredProviders` expects canonical provider IDs:
 
 - `telegram`, `whatsapp`, `signal`, `discord`, `slack`, `matrix`, `msteams`, `imessage`, `web`, `voice`
-- model/provider IDs like `openai`, `anthropic`, `ollama` (for fallback hook contexts)
+- internal/system-style providers like `cron-event`, `heartbeat`, `exec-event`
 
 ## Migration note
 
@@ -131,11 +142,19 @@ Legacy alias keys are not supported in this release. Config validation fails if 
 - `advanced.embedding`, `advanced.embeddings`, `advanced.handoff*`
 - previous top-level tuning keys
 
+## Runtime persistence
+
+Classifier runtime state is persisted automatically under the OpenClaw state directory (`plugins/<plugin-id>/runtime-state.v1.json`).
+
+- Persisted: per-session topic history, pending soft-signal windows, topic centroid, rotation dedupe map.
+- Not persisted: transient message-event dedupe cache.
+- No extra config is required.
+
 ## Log interpretation
 
 Classifier logs look like:
 
-`topic-shift-reset: classify source=<fast|fallback> kind=<...> reason=<...> ...`
+`topic-shift-reset: classify source=<user|agent> kind=<...> reason=<...> ...`
 
 Kinds:
 
@@ -150,3 +169,4 @@ Other lines:
 - `skip-low-signal`: message skipped by hard signal floor (`minSignalChars`/`minSignalTokenCount`).
 - `would-rotate`: `dryRun=true` synthetic rotate event (no reset mutation).
 - `rotated`: actual session rotation happened.
+- `classify` / `skip-low-signal` / `user-route-skip` / `agent-route-skip`: debug-level diagnostics (`debug=true`).

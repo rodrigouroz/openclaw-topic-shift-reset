@@ -2,6 +2,8 @@
 
 OpenClaw plugin that detects topic shifts and rotates to a fresh session automatically.
 
+Classifier input sources: inbound user message text (`message_received`) and successful outbound agent message text (`message_sent`) only. It does not classify `before_model_resolve` prompt wrappers.
+
 ## Why this plugin exists
 
 OpenClaw builds each model call with the current prompt plus session history. As one session accumulates mixed topics, prompts get larger, token usage grows, and context-overflow/compaction pressure increases.
@@ -11,6 +13,7 @@ This plugin tries to prevent that by detecting topic shifts and rotating to a ne
 - fewer prompt tokens per turn after a shift
 - less stale context bleeding into new questions
 - lower chance of overflow/compaction churn on long chats
+- classifier state persisted across gateway restarts (no cold start after reboot)
 
 Does it deliver? Yes for clear topic changes, especially with embeddings enabled and sane defaults. It is not a core patch, so behavior is best-effort: subtle/short messages can be ambiguous, and hook timing means the triggering turn cannot be guaranteed to become the very first persisted message of the new session in every path.
 
@@ -41,6 +44,10 @@ Add this plugin entry in `~/.openclaw/openclaw.json` (or merge into your existin
             "mode": "summary",
             "lastN": 6,
             "maxChars": 220
+          },
+          "softSuspect": {
+            "action": "ask",
+            "ttlSeconds": 120
           },
           "dryRun": false,
           "debug": false
@@ -101,11 +108,82 @@ Provider options:
 - `ollama`
 - `none` (lexical only)
 
+## Soft suspect clarification
+
+When the classifier sees a soft topic-shift signal (`suspect`) but not enough confidence to rotate yet, the plugin can inject one-turn steer context so the model asks a brief clarification question before continuing.
+
+```json
+{
+  "softSuspect": {
+    "action": "ask",
+    "prompt": "Potential topic shift detected. Ask one short clarification question to confirm the user's new goal before proceeding.",
+    "ttlSeconds": 120
+  }
+}
+```
+
+- `action`: `ask` (default) or `none`.
+- `prompt`: optional custom steer text.
+- `ttlSeconds`: max age before a pending steer expires.
+
 ## Logs
 
 ```bash
 openclaw logs --follow --plain | rg topic-shift-reset
 ```
+
+## Log reference
+
+All plugin logs are prefixed with `topic-shift-reset:`.
+
+### Info
+
+- `embedding backend <name>`
+  Embeddings are active (`openai:*` or `ollama:*` backend).
+- `embedding backend unavailable, using lexical-only mode`
+  No embedding backend is available; lexical signals only.
+- `restored state sessions=<n> rotations=<n>`
+  Persisted runtime state restored at startup.
+- `would-rotate source=<user|agent> reason=<...> session=<...> ...`
+  Dry-run rotation decision; no session mutation is written.
+- `rotated source=<user|agent> reason=<...> session=<...> ... handoff=<0|1>`
+  Rotation executed (new `sessionId` written). `handoff=1` means handoff context was enqueued.
+
+### Debug (`debug: true`)
+
+- `classify source=<...> kind=<warmup|stable|suspect|rotate-hard|rotate-soft> reason=<...> ...`
+  Full classifier output and metrics for a processed message.
+- `skip-internal-provider source=<...> provider=<...> session=<...>`
+  Skipped event from internal/non-user provider (for example cron/system paths).
+- `skip-low-signal source=<...> session=<...> chars=<n> tokens=<n>`
+  Skipped message because it did not meet minimum signal thresholds.
+- `user-route-skip channel=<...> peer=<...> err=<...>`
+  User-message route resolution failed, so the inbound event was ignored.
+- `agent-route-skip channel=<...> peer=<...> err=<...>`
+  Agent-message route resolution failed, so the outbound event was ignored.
+- `state-flushed reason=<scheduled|urgent|gateway-stop> sessions=<n> rotations=<n>`
+  In-memory classifier state flushed to persistence storage.
+
+### Warn
+
+- `rotate failed no-session-entry session=<...>`
+  Rotation was requested but no matching session entry was found to mutate.
+- `handoff tail fallback full-read file=<...>`
+  Tail read optimization fell back to a full transcript read.
+- `handoff read failed file=<...> err=<...>`
+  Could not read prior session transcript for handoff injection.
+- `persistence disabled (state path): <err>`
+  Plugin could not resolve state path; persistence is disabled.
+- `state flush failed err=<...>`
+  Failed to write persistent state.
+- `state restore failed err=<...>`
+  Failed to read/parse persistent state.
+- `state version mismatch expected=<...> got=<...>; ignoring persisted state`
+  Stored persistence schema version differs; old state is ignored.
+- `embedding backend init failed: <err>`
+  Embedding backend initialization failed at startup.
+- `embeddings error backend=<name> err=<...>`
+  Runtime embedding request failed for a message; processing continues.
 
 ## Advanced tuning
 
@@ -132,4 +210,4 @@ No build step is required. OpenClaw loads `src/index.ts` via jiti.
 
 ## Known tradeoff (plugin-only)
 
-This plugin improves timing with fast path + fallback, but cannot guarantee 100% that the triggering message becomes the first persisted message of the new session without core pre-session hooks.
+This plugin cannot guarantee 100% that the triggering message becomes the first persisted message of the new session because resets happen in runtime hooks and provider pipelines vary.

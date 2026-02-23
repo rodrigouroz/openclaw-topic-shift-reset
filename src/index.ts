@@ -11,6 +11,7 @@ import {
 type PresetName = "conservative" | "balanced" | "aggressive";
 type EmbeddingProvider = "auto" | "none" | "openai" | "ollama";
 type HandoffMode = "none" | "summary" | "verbatim_last_n";
+type SoftSuspectAction = "none" | "ask";
 
 type EmbeddingConfig = {
   provider?: EmbeddingProvider;
@@ -24,6 +25,12 @@ type HandoffConfig = {
   mode?: HandoffMode;
   lastN?: number;
   maxChars?: number;
+};
+
+type SoftSuspectConfig = {
+  action?: SoftSuspectAction;
+  prompt?: string;
+  ttlSeconds?: number;
 };
 
 type StripRulesConfig = {
@@ -62,6 +69,7 @@ type TopicShiftResetConfig = {
   preset?: PresetName;
   embedding?: EmbeddingConfig;
   handoff?: HandoffConfig;
+  softSuspect?: SoftSuspectConfig;
   dryRun?: boolean;
   debug?: boolean;
   advanced?: TopicShiftResetAdvancedConfig;
@@ -99,6 +107,11 @@ type ResolvedConfig = {
     mode: HandoffMode;
     lastN: number;
     maxChars: number;
+  };
+  softSuspect: {
+    action: SoftSuspectAction;
+    prompt: string;
+    ttlMs: number;
   };
   embedding: {
     provider: EmbeddingProvider;
@@ -141,6 +154,30 @@ type SessionState = {
   lastSeenAt: number;
 };
 
+type PersistedHistoryEntry = {
+  tokens: string[];
+  at: number;
+  embedding?: number[];
+};
+
+type PersistedSessionState = {
+  history: PersistedHistoryEntry[];
+  pendingSoftSignals: number;
+  pendingEntries: PersistedHistoryEntry[];
+  lastResetAt?: number;
+  topicCentroid?: number[];
+  topicCount: number;
+  topicDim?: number;
+  lastSeenAt: number;
+};
+
+type PersistedRuntimeState = {
+  version: number;
+  savedAt: number;
+  sessionStateBySessionKey: Record<string, PersistedSessionState>;
+  recentRotationBySession: Record<string, number>;
+};
+
 type ClassifierMetrics = {
   score: number;
   novelty: number;
@@ -173,6 +210,8 @@ type FastMessageEventLike = {
   from?: string;
   metadata?: Record<string, unknown>;
 };
+
+type ClassificationSource = "user" | "agent";
 
 type TranscriptMessage = {
   role: string;
@@ -245,6 +284,10 @@ const DEFAULTS = {
   handoffMode: "summary" as HandoffMode,
   handoffLastN: 6,
   handoffMaxChars: 220,
+  softSuspectAction: "ask" as SoftSuspectAction,
+  softSuspectPrompt:
+    "Potential topic shift detected. Ask one short clarification question to confirm the user's new goal before proceeding.",
+  softSuspectTtlSeconds: 120,
   embeddingProvider: "auto" as EmbeddingProvider,
   embeddingTimeoutMs: 7000,
   minSignalChars: 20,
@@ -274,14 +317,20 @@ const LOCK_OPTIONS = {
     maxTimeout: 250,
     randomize: true,
   },
-  stale: 45_000,
+  stale: 30 * 60 * 1000,
 } as const;
 
 const MAX_TRACKED_SESSIONS = 10_000;
 const STALE_SESSION_STATE_MS = 4 * 60 * 60 * 1000;
-const MAX_RECENT_FAST_EVENTS = 20_000;
-const FAST_EVENT_TTL_MS = 5 * 60 * 1000;
+const MAX_RECENT_MESSAGE_EVENTS = 20_000;
+const MESSAGE_EVENT_TTL_MS = 5 * 60 * 1000;
 const ROTATION_DEDUPE_MS = 25_000;
+const PERSISTENCE_SCHEMA_VERSION = 1;
+const PERSISTENCE_FILE_NAME = "runtime-state.v1.json";
+const PERSISTENCE_FLUSH_DEBOUNCE_MS = 1_200;
+const MAX_TOKENS_PER_PERSISTED_ENTRY = 256;
+const MAX_PERSISTED_EMBEDDING_DIM = 8_192;
+const MAX_PERSISTED_PENDING_ENTRIES = 8;
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -348,6 +397,17 @@ function normalizeHandoffMode(value: unknown): HandoffMode {
   return DEFAULTS.handoffMode;
 }
 
+function normalizeSoftSuspectAction(value: unknown): SoftSuspectAction {
+  if (typeof value !== "string") {
+    return DEFAULTS.softSuspectAction;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "none" || normalized === "ask") {
+    return normalized;
+  }
+  return DEFAULTS.softSuspectAction;
+}
+
 function compileRegexList(values: unknown, fallback: readonly string[]): RegExp[] {
   const source = Array.isArray(values) ? values : fallback;
   const out: RegExp[] = [];
@@ -374,6 +434,156 @@ function normalizeStringList(values: unknown, fallback: readonly string[]): stri
     .filter((item): item is string => typeof item === "string")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function sanitizeTimestamp(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+  return Math.floor(value);
+}
+
+function sanitizeEmbeddingVector(value: unknown): number[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) {
+    return undefined;
+  }
+  const out: number[] = [];
+  for (const item of value) {
+    if (typeof item !== "number" || !Number.isFinite(item)) {
+      continue;
+    }
+    out.push(item);
+    if (out.length >= MAX_PERSISTED_EMBEDDING_DIM) {
+      break;
+    }
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function normalizeTokenArray(values: unknown): string[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const value of values) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const token = value.trim();
+    if (!token) {
+      continue;
+    }
+    out.push(token);
+    if (out.length >= MAX_TOKENS_PER_PERSISTED_ENTRY) {
+      break;
+    }
+  }
+  return out;
+}
+
+function serializeHistoryEntry(entry: HistoryEntry, includeEmbedding: boolean): PersistedHistoryEntry {
+  const tokens = [...entry.tokens]
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .slice(0, MAX_TOKENS_PER_PERSISTED_ENTRY);
+  const persisted: PersistedHistoryEntry = {
+    tokens,
+    at: sanitizeTimestamp(entry.at, Date.now()),
+  };
+  if (includeEmbedding && Array.isArray(entry.embedding) && entry.embedding.length > 0) {
+    persisted.embedding = entry.embedding.filter(Number.isFinite).slice(0, MAX_PERSISTED_EMBEDDING_DIM);
+  }
+  return persisted;
+}
+
+function deserializeHistoryEntry(
+  value: unknown,
+  includeEmbedding: boolean,
+): HistoryEntry | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Partial<PersistedHistoryEntry>;
+  const tokens = normalizeTokenArray(record.tokens);
+  if (tokens.length === 0) {
+    return null;
+  }
+  const entry: HistoryEntry = {
+    tokens: new Set(tokens),
+    at: sanitizeTimestamp(record.at, Date.now()),
+  };
+  if (includeEmbedding) {
+    entry.embedding = sanitizeEmbeddingVector(record.embedding);
+  }
+  return entry;
+}
+
+function serializeSessionState(state: SessionState): PersistedSessionState {
+  const history = trimHistory(state.history, 40).map((entry) => serializeHistoryEntry(entry, false));
+  const pendingEntries = trimHistory(state.pendingEntries, MAX_PERSISTED_PENDING_ENTRIES).map((entry) =>
+    serializeHistoryEntry(entry, true),
+  );
+  const topicCentroid =
+    Array.isArray(state.topicCentroid) && state.topicCentroid.length > 0
+      ? state.topicCentroid.filter(Number.isFinite).slice(0, MAX_PERSISTED_EMBEDDING_DIM)
+      : undefined;
+
+  return {
+    history,
+    pendingSoftSignals: clampInt(state.pendingSoftSignals, 0, 0, 16),
+    pendingEntries,
+    lastResetAt:
+      typeof state.lastResetAt === "number" && Number.isFinite(state.lastResetAt)
+        ? Math.floor(state.lastResetAt)
+        : undefined,
+    topicCentroid,
+    topicCount: clampInt(state.topicCount, topicCentroid ? 1 : 0, 0, Number.MAX_SAFE_INTEGER),
+    topicDim:
+      typeof state.topicDim === "number" && Number.isFinite(state.topicDim) && state.topicDim > 0
+        ? Math.floor(state.topicDim)
+        : topicCentroid?.length,
+    lastSeenAt: sanitizeTimestamp(state.lastSeenAt, Date.now()),
+  };
+}
+
+function deserializeSessionState(value: unknown, cfg: ResolvedConfig): SessionState | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Partial<PersistedSessionState>;
+  const historySource = Array.isArray(record.history) ? record.history : [];
+  const pendingSource = Array.isArray(record.pendingEntries) ? record.pendingEntries : [];
+
+  const history = trimHistory(
+    historySource
+      .map((entry) => deserializeHistoryEntry(entry, false))
+      .filter((entry): entry is HistoryEntry => !!entry),
+    cfg.historyWindow,
+  );
+  const pendingEntries = trimHistory(
+    pendingSource
+      .map((entry) => deserializeHistoryEntry(entry, true))
+      .filter((entry): entry is HistoryEntry => !!entry),
+    Math.max(MAX_PERSISTED_PENDING_ENTRIES, cfg.softConsecutiveSignals),
+  );
+
+  const topicCentroid = sanitizeEmbeddingVector(record.topicCentroid);
+  const topicCount = clampInt(record.topicCount, topicCentroid ? 1 : 0, 0, Number.MAX_SAFE_INTEGER);
+  const topicDim = clampInt(record.topicDim, topicCentroid?.length ?? 0, 0, MAX_PERSISTED_EMBEDDING_DIM);
+
+  return {
+    history,
+    pendingSoftSignals: clampInt(record.pendingSoftSignals, 0, 0, 16),
+    pendingEntries,
+    lastResetAt:
+      typeof record.lastResetAt === "number" && Number.isFinite(record.lastResetAt)
+        ? Math.floor(record.lastResetAt)
+        : undefined,
+    topicCentroid,
+    topicCount,
+    topicDim: topicDim > 0 ? topicDim : topicCentroid?.length,
+    lastSeenAt: sanitizeTimestamp(record.lastSeenAt, Date.now()),
+  };
 }
 
 function normalizeProviderId(raw: string): string {
@@ -427,6 +637,19 @@ function normalizeProviderId(raw: string): string {
   return provider;
 }
 
+function isInternalNonUserProvider(provider: string): boolean {
+  if (!provider) {
+    return false;
+  }
+  return (
+    provider === "heartbeat" ||
+    provider === "exec-event" ||
+    provider.startsWith("cron") ||
+    provider.includes("heartbeat") ||
+    provider.includes("cron")
+  );
+}
+
 function resolveConfig(raw: unknown): ResolvedConfig {
   const obj = raw && typeof raw === "object" ? (raw as TopicShiftResetConfig) : {};
   const advanced =
@@ -437,6 +660,10 @@ function resolveConfig(raw: unknown): ResolvedConfig {
     obj.embedding && typeof obj.embedding === "object" ? (obj.embedding as EmbeddingConfig) : {};
   const handoff =
     obj.handoff && typeof obj.handoff === "object" ? (obj.handoff as HandoffConfig) : {};
+  const softSuspect =
+    obj.softSuspect && typeof obj.softSuspect === "object"
+      ? (obj.softSuspect as SoftSuspectConfig)
+      : {};
   const stripRules =
     advanced.stripRules && typeof advanced.stripRules === "object"
       ? (advanced.stripRules as StripRulesConfig)
@@ -560,6 +787,14 @@ function resolveConfig(raw: unknown): ResolvedConfig {
       mode: normalizeHandoffMode(handoff.mode),
       lastN: clampInt(handoff.lastN, DEFAULTS.handoffLastN, 1, 20),
       maxChars: clampInt(handoff.maxChars, DEFAULTS.handoffMaxChars, 60, 800),
+    },
+    softSuspect: {
+      action: normalizeSoftSuspectAction(softSuspect.action),
+      prompt:
+        typeof softSuspect.prompt === "string" && softSuspect.prompt.trim()
+          ? softSuspect.prompt.trim()
+          : DEFAULTS.softSuspectPrompt,
+      ttlMs: clampInt(softSuspect.ttlSeconds, DEFAULTS.softSuspectTtlSeconds, 10, 1_800) * 1000,
     },
     embedding: {
       provider: normalizeEmbeddingProvider(embedding.provider),
@@ -1274,15 +1509,17 @@ async function buildHandoffEventFromPreviousSession(params: {
   }
 }
 
-function pruneStateMaps(stateBySession: Map<string, SessionState>): void {
+function pruneStateMaps(stateBySession: Map<string, SessionState>): boolean {
+  let changed = false;
   const now = Date.now();
   for (const [sessionKey, state] of stateBySession) {
     if (now - state.lastSeenAt > STALE_SESSION_STATE_MS) {
       stateBySession.delete(sessionKey);
+      changed = true;
     }
   }
   if (stateBySession.size <= MAX_TRACKED_SESSIONS) {
-    return;
+    return changed;
   }
   const ordered = [...stateBySession.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt);
   const toDrop = stateBySession.size - MAX_TRACKED_SESSIONS;
@@ -1290,19 +1527,23 @@ function pruneStateMaps(stateBySession: Map<string, SessionState>): void {
     const sessionKey = ordered[i]?.[0];
     if (sessionKey) {
       stateBySession.delete(sessionKey);
+      changed = true;
     }
   }
+  return changed;
 }
 
-function pruneRecentMap(map: Map<string, number>, ttlMs: number, maxSize: number): void {
+function pruneRecentMap(map: Map<string, number>, ttlMs: number, maxSize: number): boolean {
+  let changed = false;
   const now = Date.now();
   for (const [key, ts] of map) {
     if (now - ts > ttlMs) {
       map.delete(key);
+      changed = true;
     }
   }
   if (map.size <= maxSize) {
-    return;
+    return changed;
   }
   const ordered = [...map.entries()].sort((a, b) => a[1] - b[1]);
   const toDrop = map.size - maxSize;
@@ -1310,8 +1551,10 @@ function pruneRecentMap(map: Map<string, number>, ttlMs: number, maxSize: number
     const key = ordered[i]?.[0];
     if (key) {
       map.delete(key);
+      changed = true;
     }
   }
+  return changed;
 }
 
 async function rotateSessionEntry(params: {
@@ -1319,7 +1562,7 @@ async function rotateSessionEntry(params: {
   cfg: ResolvedConfig;
   sessionKey: string;
   agentId?: string;
-  source: "fast" | "fallback";
+  source: ClassificationSource;
   reason: string;
   metrics: ClassifierMetrics;
   entry: HistoryEntry;
@@ -1424,8 +1667,184 @@ async function rotateSessionEntry(params: {
 export default function register(api: OpenClawPluginApi): void {
   const cfg = resolveConfig(api.pluginConfig);
   const sessionState = new Map<string, SessionState>();
-  const recentFastEvents = new Map<string, number>();
+  const recentUserEvents = new Map<string, number>();
+  const recentAgentEvents = new Map<string, number>();
   const recentRotationBySession = new Map<string, number>();
+  const pendingSoftSuspectSteeringBySession = new Map<string, number>();
+  const sessionWorkQueue = new Map<string, Promise<unknown>>();
+
+  const persistencePath = (() => {
+    try {
+      const stateDir = api.runtime.state.resolveStateDir();
+      return path.join(stateDir, "plugins", api.id, PERSISTENCE_FILE_NAME);
+    } catch (error) {
+      api.logger.warn(`topic-shift-reset: persistence disabled (state path): ${String(error)}`);
+      return null;
+    }
+  })();
+
+  let persistenceDirty = false;
+  let persistenceTimer: NodeJS.Timeout | null = null;
+  let persistenceFlushPromise: Promise<void> | null = null;
+  let persistenceLoadPromise: Promise<void> = Promise.resolve();
+
+  const clearPersistenceTimer = () => {
+    if (!persistenceTimer) {
+      return;
+    }
+    clearTimeout(persistenceTimer);
+    persistenceTimer = null;
+  };
+
+  const flushPersistentState = async (reason: string): Promise<void> => {
+    if (!persistencePath) {
+      return;
+    }
+    await persistenceLoadPromise;
+    if (!persistenceDirty) {
+      return;
+    }
+    if (persistenceFlushPromise) {
+      await persistenceFlushPromise;
+      return;
+    }
+    persistenceFlushPromise = (async () => {
+      const now = Date.now();
+      pruneStateMaps(sessionState);
+      pruneRecentMap(recentRotationBySession, ROTATION_DEDUPE_MS * 3, MAX_RECENT_MESSAGE_EVENTS);
+
+      const payload: PersistedRuntimeState = {
+        version: PERSISTENCE_SCHEMA_VERSION,
+        savedAt: now,
+        sessionStateBySessionKey: {},
+        recentRotationBySession: {},
+      };
+
+      for (const [sessionKey, state] of sessionState) {
+        payload.sessionStateBySessionKey[sessionKey] = serializeSessionState(state);
+      }
+      for (const [rotationKey, ts] of recentRotationBySession) {
+        if (now - ts <= ROTATION_DEDUPE_MS * 3) {
+          payload.recentRotationBySession[rotationKey] = ts;
+        }
+      }
+
+      await withFileLock(persistencePath, LOCK_OPTIONS, async () => {
+        await writeJsonFileAtomically(persistencePath, payload);
+      });
+      persistenceDirty = false;
+      if (cfg.debug) {
+        api.logger.debug(
+          `topic-shift-reset: state-flushed reason=${reason} sessions=${sessionState.size} rotations=${recentRotationBySession.size}`,
+        );
+      }
+    })()
+      .catch((error) => {
+        api.logger.warn(`topic-shift-reset: state flush failed err=${String(error)}`);
+      })
+      .finally(() => {
+        persistenceFlushPromise = null;
+      });
+    await persistenceFlushPromise;
+  };
+
+  const schedulePersistentFlush = (urgent = false) => {
+    if (!persistencePath) {
+      return;
+    }
+    persistenceDirty = true;
+    if (urgent) {
+      void flushPersistentState("urgent");
+      return;
+    }
+    if (persistenceTimer) {
+      return;
+    }
+    persistenceTimer = setTimeout(() => {
+      persistenceTimer = null;
+      void flushPersistentState("scheduled");
+    }, PERSISTENCE_FLUSH_DEBOUNCE_MS);
+    persistenceTimer.unref?.();
+  };
+
+  const runSerializedBySession = async <T>(
+    sessionKey: string,
+    fn: () => Promise<T>,
+  ): Promise<T> => {
+    const previous = sessionWorkQueue.get(sessionKey) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(fn);
+    const tail = current.then(
+      () => undefined,
+      () => undefined,
+    );
+    sessionWorkQueue.set(sessionKey, tail);
+    try {
+      return await current;
+    } finally {
+      if (sessionWorkQueue.get(sessionKey) === tail) {
+        sessionWorkQueue.delete(sessionKey);
+      }
+    }
+  };
+
+  persistenceLoadPromise = (async () => {
+    if (!persistencePath) {
+      return;
+    }
+    try {
+      const loaded = await withFileLock(persistencePath, LOCK_OPTIONS, async () => {
+        return await readJsonFileWithFallback<PersistedRuntimeState | null>(persistencePath, null);
+      });
+      const value = loaded.value;
+      if (!value || typeof value !== "object") {
+        return;
+      }
+      if (value.version !== PERSISTENCE_SCHEMA_VERSION) {
+        api.logger.warn(
+          `topic-shift-reset: state version mismatch expected=${PERSISTENCE_SCHEMA_VERSION} got=${String(value.version)}; ignoring persisted state`,
+        );
+        return;
+      }
+
+      const restoredSessionStateByKey =
+        value.sessionStateBySessionKey && typeof value.sessionStateBySessionKey === "object"
+          ? value.sessionStateBySessionKey
+          : {};
+      for (const [sessionKey, rawState] of Object.entries(restoredSessionStateByKey)) {
+        const trimmedSessionKey = sessionKey.trim();
+        if (!trimmedSessionKey) {
+          continue;
+        }
+        const restored = deserializeSessionState(rawState, cfg);
+        if (!restored) {
+          continue;
+        }
+        sessionState.set(trimmedSessionKey, restored);
+      }
+      pruneStateMaps(sessionState);
+
+      const restoredRotationByKey =
+        value.recentRotationBySession && typeof value.recentRotationBySession === "object"
+          ? value.recentRotationBySession
+          : {};
+      for (const [key, ts] of Object.entries(restoredRotationByKey)) {
+        if (!key.trim()) {
+          continue;
+        }
+        if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) {
+          continue;
+        }
+        recentRotationBySession.set(key, Math.floor(ts));
+      }
+      pruneRecentMap(recentRotationBySession, ROTATION_DEDUPE_MS * 3, MAX_RECENT_MESSAGE_EVENTS);
+
+      api.logger.info(
+        `topic-shift-reset: restored state sessions=${sessionState.size} rotations=${recentRotationBySession.size}`,
+      );
+    } catch (error) {
+      api.logger.warn(`topic-shift-reset: state restore failed err=${String(error)}`);
+    }
+  })();
 
   let embeddingBackend: EmbeddingBackend | null = null;
   let embeddingInitError: string | null = null;
@@ -1443,23 +1862,32 @@ export default function register(api: OpenClawPluginApi): void {
     api.logger.info(`topic-shift-reset: embedding backend ${embeddingBackend.name}`);
   }
 
-  const classifyAndMaybeRotate = async (params: {
-    source: "fast" | "fallback";
+  const classifyAndMaybeRotateInner = async (params: {
+    source: ClassificationSource;
     sessionKey: string;
     text: string;
     messageProvider?: string;
     agentId?: string;
   }) => {
+    await persistenceLoadPromise;
     if (!cfg.enabled) {
       return;
     }
-    const sessionKey = params.sessionKey.trim();
+    const sessionKey = params.sessionKey;
     if (!sessionKey) {
       return;
     }
 
     const provider = normalizeProviderId(params.messageProvider ?? "");
     if (provider && cfg.ignoredProviders.has(provider)) {
+      return;
+    }
+    if (isInternalNonUserProvider(provider)) {
+      if (cfg.debug) {
+        api.logger.debug(
+          `topic-shift-reset: skip-internal-provider source=${params.source} provider=${provider} session=${sessionKey}`,
+        );
+      }
       return;
     }
 
@@ -1472,7 +1900,7 @@ export default function register(api: OpenClawPluginApi): void {
     const tokenList = tokenizeList(text, cfg.minTokenLength);
     if (text.length < cfg.minSignalChars || tokenList.length < cfg.minSignalTokenCount) {
       if (cfg.debug) {
-        api.logger.info(
+        api.logger.debug(
           [
             `topic-shift-reset: skip-low-signal`,
             `source=${params.source}`,
@@ -1487,13 +1915,12 @@ export default function register(api: OpenClawPluginApi): void {
 
     const tokens = new Set(tokenList);
 
+    const now = Date.now();
     const contentHash = hashString(normalizeTextForHash(text));
     const lastRotationAt = recentRotationBySession.get(`${sessionKey}:${contentHash}`);
-    if (typeof lastRotationAt === "number" && Date.now() - lastRotationAt < ROTATION_DEDUPE_MS) {
+    if (typeof lastRotationAt === "number" && now - lastRotationAt < ROTATION_DEDUPE_MS) {
       return;
     }
-
-    const now = Date.now();
     const state =
       sessionState.get(sessionKey) ??
       ({
@@ -1558,7 +1985,7 @@ export default function register(api: OpenClawPluginApi): void {
     });
 
     if (cfg.debug) {
-      api.logger.info(
+      api.logger.debug(
         [
           `topic-shift-reset: classify`,
           `source=${params.source}`,
@@ -1578,16 +2005,19 @@ export default function register(api: OpenClawPluginApi): void {
     }
 
     if (decision.kind === "warmup") {
+      pendingSoftSuspectSteeringBySession.delete(sessionKey);
       state.pendingSoftSignals = 0;
       state.pendingEntries = [];
       state.history = trimHistory([...state.history, entry], cfg.historyWindow);
       updateTopicCentroid(state, entry.embedding);
       sessionState.set(sessionKey, state);
       pruneStateMaps(sessionState);
+      schedulePersistentFlush(false);
       return;
     }
 
     if (decision.kind === "stable") {
+      pendingSoftSuspectSteeringBySession.delete(sessionKey);
       const merged = [...state.history, ...state.pendingEntries, entry];
       for (const item of [...state.pendingEntries, entry]) {
         updateTopicCentroid(state, item.embedding);
@@ -1597,14 +2027,24 @@ export default function register(api: OpenClawPluginApi): void {
       state.history = trimHistory(merged, cfg.historyWindow);
       sessionState.set(sessionKey, state);
       pruneStateMaps(sessionState);
+      schedulePersistentFlush(false);
       return;
     }
 
     if (decision.kind === "suspect") {
+      if (cfg.softSuspect.action === "ask") {
+        pendingSoftSuspectSteeringBySession.set(sessionKey, now);
+        pruneRecentMap(
+          pendingSoftSuspectSteeringBySession,
+          Math.max(cfg.softSuspect.ttlMs * 2, 60_000),
+          MAX_RECENT_MESSAGE_EVENTS,
+        );
+      }
       state.pendingSoftSignals += 1;
       state.pendingEntries = trimHistory([...state.pendingEntries, entry], cfg.softConsecutiveSignals);
       sessionState.set(sessionKey, state);
       pruneStateMaps(sessionState);
+      schedulePersistentFlush(false);
       return;
     }
 
@@ -1625,14 +2065,42 @@ export default function register(api: OpenClawPluginApi): void {
     });
 
     if (rotated) {
+      pendingSoftSuspectSteeringBySession.delete(sessionKey);
       if (!cfg.dryRun) {
         recentRotationBySession.set(`${sessionKey}:${contentHash}`, Date.now());
       }
+      schedulePersistentFlush(true);
     }
 
     sessionState.set(sessionKey, state);
     pruneStateMaps(sessionState);
-    pruneRecentMap(recentRotationBySession, ROTATION_DEDUPE_MS * 3, MAX_RECENT_FAST_EVENTS);
+    const prunedRotations = pruneRecentMap(
+      recentRotationBySession,
+      ROTATION_DEDUPE_MS * 3,
+      MAX_RECENT_MESSAGE_EVENTS,
+    );
+    if (prunedRotations) {
+      schedulePersistentFlush(false);
+    }
+  };
+
+  const classifyAndMaybeRotate = async (params: {
+    source: ClassificationSource;
+    sessionKey: string;
+    text: string;
+    messageProvider?: string;
+    agentId?: string;
+  }) => {
+    const sessionKey = params.sessionKey.trim();
+    if (!sessionKey) {
+      return;
+    }
+    await runSerializedBySession(sessionKey, async () => {
+      await classifyAndMaybeRotateInner({
+        ...params,
+        sessionKey,
+      });
+    });
   };
 
   api.on("message_received", async (event, ctx) => {
@@ -1650,21 +2118,22 @@ export default function register(api: OpenClawPluginApi): void {
       return;
     }
 
-    const fastEventKey = [
+    const userEventKey = [
       channelId,
       ctx.accountId ?? "",
       peer.kind,
       peer.id,
       hashString(normalizeTextForHash(text)),
     ].join("|");
-    const seenAt = recentFastEvents.get(fastEventKey);
-    if (typeof seenAt === "number" && Date.now() - seenAt < FAST_EVENT_TTL_MS) {
+    const seenAt = recentUserEvents.get(userEventKey);
+    if (typeof seenAt === "number" && Date.now() - seenAt < MESSAGE_EVENT_TTL_MS) {
       return;
     }
-    recentFastEvents.set(fastEventKey, Date.now());
-    pruneRecentMap(recentFastEvents, FAST_EVENT_TTL_MS, MAX_RECENT_FAST_EVENTS);
+    recentUserEvents.set(userEventKey, Date.now());
+    pruneRecentMap(recentUserEvents, MESSAGE_EVENT_TTL_MS, MAX_RECENT_MESSAGE_EVENTS);
 
     let resolvedSessionKey = "";
+    let resolvedAgentId: string | undefined;
     try {
       const route = api.runtime.channel.routing.resolveAgentRoute({
         cfg: api.config,
@@ -1673,38 +2142,107 @@ export default function register(api: OpenClawPluginApi): void {
         peer,
       });
       resolvedSessionKey = route.sessionKey;
+      resolvedAgentId = route.agentId;
     } catch (error) {
       if (cfg.debug) {
-        api.logger.info(
-          `topic-shift-reset: fast-route-skip channel=${channelId} peer=${maybeJson(peer)} err=${String(error)}`,
+        api.logger.debug(
+          `topic-shift-reset: user-route-skip channel=${channelId} peer=${maybeJson(peer)} err=${String(error)}`,
         );
       }
       return;
     }
 
     await classifyAndMaybeRotate({
-      source: "fast",
+      source: "user",
       sessionKey: resolvedSessionKey,
       text,
       messageProvider: channelId,
+      agentId: resolvedAgentId,
     });
   });
 
-  api.on("before_model_resolve", async (event, ctx) => {
+  api.on("message_sent", async (event, ctx) => {
     if (!cfg.enabled) {
+      return;
+    }
+    if (!event.success) {
+      return;
+    }
+    const channelId = ctx.channelId?.trim();
+    if (!channelId) {
+      return;
+    }
+    const text = event.content?.trim() ?? "";
+    if (!text) {
+      return;
+    }
+
+    const peer = inferFastPeer({ from: event.to }, { conversationId: ctx.conversationId });
+    const agentEventKey = [
+      channelId,
+      ctx.accountId ?? "",
+      peer.kind,
+      peer.id,
+      hashString(normalizeTextForHash(text)),
+    ].join("|");
+    const seenAt = recentAgentEvents.get(agentEventKey);
+    if (typeof seenAt === "number" && Date.now() - seenAt < MESSAGE_EVENT_TTL_MS) {
+      return;
+    }
+    recentAgentEvents.set(agentEventKey, Date.now());
+    pruneRecentMap(recentAgentEvents, MESSAGE_EVENT_TTL_MS, MAX_RECENT_MESSAGE_EVENTS);
+
+    let resolvedSessionKey = "";
+    let resolvedAgentId: string | undefined;
+    try {
+      const route = api.runtime.channel.routing.resolveAgentRoute({
+        cfg: api.config,
+        channel: channelId,
+        accountId: ctx.accountId,
+        peer,
+      });
+      resolvedSessionKey = route.sessionKey;
+      resolvedAgentId = route.agentId;
+    } catch (error) {
+      if (cfg.debug) {
+        api.logger.debug(
+          `topic-shift-reset: agent-route-skip channel=${channelId} peer=${maybeJson(peer)} err=${String(error)}`,
+        );
+      }
+      return;
+    }
+
+    await classifyAndMaybeRotate({
+      source: "agent",
+      sessionKey: resolvedSessionKey,
+      text,
+      messageProvider: channelId,
+      agentId: resolvedAgentId,
+    });
+  });
+
+  api.on("before_prompt_build", async (_event, ctx) => {
+    if (!cfg.enabled || cfg.softSuspect.action !== "ask") {
       return;
     }
     const sessionKey = ctx.sessionKey?.trim();
     if (!sessionKey) {
       return;
     }
+    const seenAt = pendingSoftSuspectSteeringBySession.get(sessionKey);
+    if (typeof seenAt !== "number") {
+      return;
+    }
+    if (Date.now() - seenAt > cfg.softSuspect.ttlMs) {
+      pendingSoftSuspectSteeringBySession.delete(sessionKey);
+      return;
+    }
+    pendingSoftSuspectSteeringBySession.delete(sessionKey);
+    return { prependContext: cfg.softSuspect.prompt };
+  });
 
-    await classifyAndMaybeRotate({
-      source: "fallback",
-      sessionKey,
-      text: event.prompt,
-      messageProvider: ctx.messageProvider,
-      agentId: ctx.agentId,
-    });
+  api.on("gateway_stop", async () => {
+    clearPersistenceTimer();
+    await flushPersistentState("gateway-stop");
   });
 }
