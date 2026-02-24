@@ -418,6 +418,37 @@ describe("openclaw-topic-shift-reset", () => {
     expect(apiBundle.hooks.has("message_sent")).toBe(true);
   });
 
+  it("includes message preview fields in classify debug logs", async () => {
+    const sdkState = createSdkMockState();
+    const register = await importRegisterWithSdkMock(sdkState);
+    const apiBundle = createTestApi({
+      stateDirResolver: () => {
+        throw new Error("disable persistence for this test");
+      },
+      pluginConfig: {
+        embedding: { provider: "none" },
+        debug: true,
+      },
+      resolveStorePathImpl: () => path.join(os.tmpdir(), "topic-shift-reset-unused-store.json"),
+    });
+    register(apiBundle.api);
+
+    await emitUserMessage(apiBundle.hooks, {
+      text: "Problem in node 'Scan Markets' after nightly sync. Please inspect parser mismatch.",
+      conversationId: "user-1",
+    });
+
+    const classifyLog = apiBundle.logger.debug.mock.calls
+      .map(([message]) => String(message))
+      .find((message) => message.includes("topic-shift-reset: classify"));
+
+    expect(classifyLog).toBeTruthy();
+    expect(classifyLog).toContain("textHash=");
+    expect(classifyLog).toContain("tokens=");
+    expect(classifyLog).toContain("text=");
+    expect((classifyLog ?? "").toLowerCase()).toContain("scan markets");
+  });
+
   it("uses outbound agent text only for context updates and skips failed sends", async () => {
     const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "topic-shift-reset-double-count-"));
     const storePath = path.join(rootDir, "agents", "main", "sessions", "sessions.json");

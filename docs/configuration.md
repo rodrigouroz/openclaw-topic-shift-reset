@@ -47,7 +47,7 @@ With `softSuspect.mode: "strict"` (default), a soft-confirm reset is blocked unt
 - `softSuspect.prompt`: optional steer text injected on soft-suspect.
 - `softSuspect.ttlSeconds`: expiry for pending soft-suspect steer.
 - `dryRun`: logs would-rotate events without session resets.
-- `debug`: emits per-message classifier diagnostics.
+- `debug`: emits per-message classifier diagnostics, including compact message previews.
 
 ## Built-in preset defaults
 

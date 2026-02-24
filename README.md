@@ -154,8 +154,8 @@ All plugin logs are prefixed with `topic-shift-reset:`.
 
 ### Debug (`debug: true`)
 
-- `classify source=<...> kind=<warmup|stable|suspect|rotate-hard|rotate-soft> reason=<...> ...`
-  Full classifier output and metrics for a processed message.
+- `classify source=<...> kind=<warmup|stable|suspect|rotate-hard|rotate-soft> reason=<...> ... textHash=<...> tokens=[...] text="..."`
+  Full classifier output and metrics plus a compact message preview for a processed message.
 - `suspect-queued session=<...>`
   Soft-suspect state queued for clarification steering.
 - `ask-injected session=<...>`

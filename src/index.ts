@@ -329,6 +329,8 @@ const STALE_SESSION_STATE_MS = 4 * 60 * 60 * 1000;
 const MAX_RECENT_MESSAGE_EVENTS = 20_000;
 const MESSAGE_EVENT_TTL_MS = 5 * 60 * 1000;
 const ROTATION_DEDUPE_MS = 25_000;
+const DEBUG_LOG_TEXT_PREVIEW_CHARS = 180;
+const DEBUG_LOG_TOKEN_PREVIEW_COUNT = 12;
 const PERSISTENCE_SCHEMA_VERSION = 1;
 const PERSISTENCE_FILE_NAME = "runtime-state.v1.json";
 const PERSISTENCE_FLUSH_DEBOUNCE_MS = 1_200;
@@ -2057,23 +2059,31 @@ export default function register(api: OpenClawPluginApi): void {
     }
 
     if (cfg.debug) {
-      api.logger.debug(
-        [
-          `topic-shift-reset: classify`,
-          `source=${params.source}`,
-          `kind=${decision.kind}`,
-          `reason=${decision.reason}`,
-          `session=${sessionKey}`,
-          `score=${decision.metrics.score.toFixed(3)}`,
-          `novelty=${decision.metrics.novelty.toFixed(3)}`,
-          `lex=${decision.metrics.lexicalDistance.toFixed(3)}`,
-          `uniq=${decision.metrics.uniqueTokenRatio.toFixed(3)}`,
-          `entropy=${decision.metrics.entropy.toFixed(3)}`,
-          `sim=${typeof decision.metrics.similarity === "number" ? decision.metrics.similarity.toFixed(3) : "n/a"}`,
-          `embed=${decision.metrics.usedEmbedding ? "1" : "0"}`,
-          `pending=${state.pendingSoftSignals}`,
-        ].join(" "),
-      );
+      const textPreview = truncateText(text, DEBUG_LOG_TEXT_PREVIEW_CHARS);
+      const rawPreview = truncateText(rawText, DEBUG_LOG_TEXT_PREVIEW_CHARS);
+      const debugFields = [
+        `topic-shift-reset: classify`,
+        `source=${params.source}`,
+        `kind=${decision.kind}`,
+        `reason=${decision.reason}`,
+        `session=${sessionKey}`,
+        `score=${decision.metrics.score.toFixed(3)}`,
+        `novelty=${decision.metrics.novelty.toFixed(3)}`,
+        `lex=${decision.metrics.lexicalDistance.toFixed(3)}`,
+        `uniq=${decision.metrics.uniqueTokenRatio.toFixed(3)}`,
+        `entropy=${decision.metrics.entropy.toFixed(3)}`,
+        `sim=${typeof decision.metrics.similarity === "number" ? decision.metrics.similarity.toFixed(3) : "n/a"}`,
+        `embed=${decision.metrics.usedEmbedding ? "1" : "0"}`,
+        `pending=${state.pendingSoftSignals}`,
+        `baseline=${baselineTokens.size}`,
+        `textHash=${contentHash}`,
+        `tokens=${maybeJson(tokenList.slice(0, DEBUG_LOG_TOKEN_PREVIEW_COUNT))}`,
+        `text=${maybeJson(textPreview)}`,
+      ];
+      if (rawPreview !== textPreview) {
+        debugFields.push(`raw=${maybeJson(rawPreview)}`);
+      }
+      api.logger.debug(debugFields.join(" "));
     }
 
     if (decision.kind === "warmup") {
