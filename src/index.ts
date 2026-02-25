@@ -1252,8 +1252,9 @@ function classifyMessage(params: {
   now: number;
 }): ClassificationDecision {
   const { cfg, state, now } = params;
+  const hasSimilarity = params.usedEmbedding && typeof params.similarity === "number";
   const score =
-    params.usedEmbedding && typeof params.similarity === "number"
+    hasSimilarity
       ? 0.7 * (1 - params.similarity) +
         0.15 * params.lexical.lexicalDistance +
         0.15 * params.lexical.novelty
@@ -1281,21 +1282,25 @@ function classifyMessage(params: {
     return { kind: "stable", metrics, reason: "cooldown" };
   }
 
+  const lexicalHardSignal =
+    params.lexical.score >= cfg.hardScoreThreshold ||
+    (params.lexical.novelty >= cfg.hardNoveltyThreshold &&
+      params.lexical.lexicalDistance >= 0.65);
   const hardSignal =
-    score >= cfg.hardScoreThreshold ||
-    (params.usedEmbedding && typeof params.similarity === "number"
-      ? params.similarity <= cfg.hardSimilarityThreshold &&
-        params.lexical.novelty >= cfg.hardNoveltyThreshold
-      : params.lexical.novelty >= cfg.hardNoveltyThreshold &&
-        params.lexical.lexicalDistance >= 0.65);
+    hasSimilarity &&
+    (score >= cfg.hardScoreThreshold ||
+      (params.similarity <= cfg.hardSimilarityThreshold &&
+        params.lexical.novelty >= cfg.hardNoveltyThreshold));
 
   if (hardSignal) {
     return { kind: "rotate-hard", metrics, reason: "hard-threshold" };
   }
 
+  const forceSoftPathFromLexicalHard = !hasSimilarity && lexicalHardSignal;
   const softSignal =
+    forceSoftPathFromLexicalHard ||
     score >= cfg.softScoreThreshold ||
-    (params.usedEmbedding && typeof params.similarity === "number"
+    (hasSimilarity
       ? params.similarity <= cfg.softSimilarityThreshold &&
         params.lexical.novelty >= cfg.softNoveltyThreshold
       : params.lexical.novelty >= cfg.softNoveltyThreshold &&

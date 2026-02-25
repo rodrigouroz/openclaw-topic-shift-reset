@@ -312,8 +312,11 @@ describe("openclaw-topic-shift-reset", () => {
           minMeaningfulTokens: 1,
           minSignalChars: 1,
           minSignalTokenCount: 1,
-          hardScoreThreshold: 0,
-          hardNoveltyThreshold: 0,
+          softConsecutiveSignals: 1,
+          softScoreThreshold: 0,
+          softNoveltyThreshold: 0,
+          hardScoreThreshold: 1,
+          hardNoveltyThreshold: 1,
         },
       },
       resolveStorePathImpl: (_store, opts) => (opts.agentId === "alpha" ? alphaStorePath : mainStorePath),
@@ -373,8 +376,11 @@ describe("openclaw-topic-shift-reset", () => {
           minMeaningfulTokens: 1,
           minSignalChars: 1,
           minSignalTokenCount: 1,
-          hardScoreThreshold: 0,
-          hardNoveltyThreshold: 0,
+          softConsecutiveSignals: 1,
+          softScoreThreshold: 0,
+          softNoveltyThreshold: 0,
+          hardScoreThreshold: 1,
+          hardNoveltyThreshold: 1,
         },
       },
       resolveStorePathImpl: () => storePath,
@@ -400,6 +406,80 @@ describe("openclaw-topic-shift-reset", () => {
     const storeWrites = sdkState.writeCalls.filter((call) => call.filePath === path.resolve(storePath));
     expect(storeWrites).toHaveLength(1);
     expect(sdkState.maxLocksByPath.get(path.resolve(storePath)) ?? 0).toBeLessThanOrEqual(1);
+  });
+
+  it("downgrades lexical hard signals to suspect when similarity is unavailable", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "topic-shift-reset-no-sim-hard-downgrade-"));
+    const storePath = path.join(rootDir, "agents", "main", "sessions", "sessions.json");
+    const sessionKey = "agent:main:main";
+    const initialSessionId = "main-initial-session";
+    await fs.mkdir(path.dirname(storePath), { recursive: true });
+    await fs.writeFile(
+      storePath,
+      JSON.stringify(
+        {
+          [sessionKey]: {
+            sessionId: initialSessionId,
+            updatedAt: Date.now(),
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const sdkState = createSdkMockState();
+    const register = await importRegisterWithSdkMock(sdkState);
+    const apiBundle = createTestApi({
+      stateDirResolver: () => {
+        throw new Error("disable persistence for this test");
+      },
+      pluginConfig: {
+        embedding: { provider: "none" },
+        debug: true,
+        advanced: {
+          minHistoryMessages: 1,
+          minMeaningfulTokens: 1,
+          minSignalChars: 1,
+          minSignalTokenCount: 1,
+          softConsecutiveSignals: 2,
+          softScoreThreshold: 1,
+          softNoveltyThreshold: 1,
+          hardScoreThreshold: 0,
+          hardNoveltyThreshold: 0,
+        },
+      },
+      resolveStorePathImpl: () => storePath,
+      resolveRouteImpl: () => ({
+        sessionKey,
+        agentId: "main",
+      }),
+    });
+    register(apiBundle.api);
+
+    await emitUserMessage(apiBundle.hooks, {
+      text: "baseline lexical context",
+      conversationId: "user-1",
+    });
+    await emitUserMessage(apiBundle.hooks, {
+      text: "totally different lexical topic trigger",
+      conversationId: "user-1",
+    });
+
+    const store = (await readJson(storePath)) as Record<string, { sessionId?: string }>;
+    expect(store[sessionKey]?.sessionId).toBe(initialSessionId);
+    expect(
+      apiBundle.logger.info.mock.calls.some(([message]) =>
+        String(message).includes("topic-shift-reset: rotated"),
+      ),
+    ).toBe(false);
+    expect(
+      apiBundle.logger.debug.mock.calls.some(([message]) => {
+        const line = String(message);
+        return line.includes("topic-shift-reset: classify") && line.includes("kind=suspect");
+      }),
+    ).toBe(true);
   });
 
   it("does not register before_model_resolve fallback classification hook", async () => {
