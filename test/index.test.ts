@@ -635,6 +635,228 @@ describe("openclaw-topic-shift-reset", () => {
     ).toBe(true);
   });
 
+  it("routes hard similarity spikes through soft confirmation when embeddings are available", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "topic-shift-reset-hard-sim-soft-path-"));
+    const storePath = path.join(rootDir, "agents", "main", "sessions", "sessions.json");
+    const sessionKey = "agent:main:main";
+    const initialSessionId = "main-initial-session";
+    const persistencePath = path.join(
+      rootDir,
+      "plugins",
+      "openclaw-topic-shift-reset",
+      "runtime-state.v1.json",
+    );
+    await fs.mkdir(path.dirname(storePath), { recursive: true });
+    await fs.mkdir(path.dirname(persistencePath), { recursive: true });
+    await fs.writeFile(
+      storePath,
+      JSON.stringify(
+        {
+          [sessionKey]: {
+            sessionId: initialSessionId,
+            updatedAt: Date.now(),
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    await fs.writeFile(
+      persistencePath,
+      JSON.stringify(
+        {
+          version: 1,
+          savedAt: Date.now(),
+          sessionStateBySessionKey: {
+            [sessionKey]: {
+              history: [{ tokens: ["baseline", "topic"], at: Date.now() - 1000 }],
+              pendingSoftSignals: 0,
+              pendingEntries: [],
+              topicCentroid: [1, 0],
+              topicCount: 1,
+              topicDim: 2,
+              lastSeenAt: Date.now(),
+            },
+          },
+          recentRotationBySession: {},
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const sdkState = createSdkMockState();
+    const register = await importRegisterWithSdkMock(sdkState);
+    const apiBundle = createTestApi({
+      stateDirResolver: () => rootDir,
+      pluginConfig: {
+        embedding: {
+          provider: "openai",
+          apiKey: "test-key",
+          baseUrl: "https://embeddings.example.test/v1",
+          timeoutMs: 2000,
+        },
+        softSuspect: {
+          action: "none",
+        },
+        debug: true,
+        advanced: {
+          minHistoryMessages: 1,
+          minMeaningfulTokens: 1,
+          minSignalChars: 1,
+          minSignalTokenCount: 1,
+          softConsecutiveSignals: 2,
+          softScoreThreshold: 1,
+          softNoveltyThreshold: 0,
+          hardScoreThreshold: 1,
+          hardNoveltyThreshold: 0,
+          softSimilarityThreshold: 0.3,
+          hardSimilarityThreshold: 0.3,
+        },
+      },
+      resolveStorePathImpl: () => storePath,
+      resolveRouteImpl: () => ({
+        sessionKey,
+        agentId: "main",
+      }),
+    });
+    register(apiBundle.api);
+
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const bodyRaw = typeof init?.body === "string" ? init.body : "{}";
+        const body = JSON.parse(bodyRaw) as { input?: string };
+        const inputText = String(body.input ?? "");
+        const vector = inputText.includes("shift") ? [0, 1] : [1, 0];
+        return new Response(JSON.stringify({ data: [{ embedding: vector }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      });
+
+    try {
+      await emitUserMessage(apiBundle.hooks, {
+        text: "first shift candidate different topic",
+        conversationId: "user-1",
+      });
+
+      const storeAfterFirst = (await readJson(storePath)) as Record<string, { sessionId?: string }>;
+      expect(storeAfterFirst[sessionKey]?.sessionId).toBe(initialSessionId);
+      expect(
+        apiBundle.logger.info.mock.calls.some(([message]) =>
+          String(message).includes("topic-shift-reset: rotated"),
+        ),
+      ).toBe(false);
+
+      await emitUserMessage(apiBundle.hooks, {
+        text: "second shift candidate different topic",
+        conversationId: "user-1",
+      });
+
+      const storeAfterSecond = (await readJson(storePath)) as Record<string, { sessionId?: string }>;
+      expect(storeAfterSecond[sessionKey]?.sessionId).toBeTruthy();
+      expect(storeAfterSecond[sessionKey]?.sessionId).not.toBe(initialSessionId);
+      expect(
+        apiBundle.logger.info.mock.calls.some(([message]) => {
+          const line = String(message);
+          return line.includes("topic-shift-reset: rotated") && line.includes("reason=soft-confirmed");
+        }),
+      ).toBe(true);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("keeps pending soft-suspect context after a soft-confirm rotation", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "topic-shift-reset-soft-history-seed-"));
+    const storePath = path.join(rootDir, "agents", "main", "sessions", "sessions.json");
+    const sessionKey = "agent:main:main";
+    const persistencePath = path.join(
+      rootDir,
+      "plugins",
+      "openclaw-topic-shift-reset",
+      "runtime-state.v1.json",
+    );
+    await fs.mkdir(path.dirname(storePath), { recursive: true });
+    await fs.writeFile(
+      storePath,
+      JSON.stringify(
+        {
+          [sessionKey]: {
+            sessionId: "main-initial-session",
+            updatedAt: Date.now(),
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const sdkState = createSdkMockState();
+    const register = await importRegisterWithSdkMock(sdkState);
+    const apiBundle = createTestApi({
+      stateDirResolver: () => rootDir,
+      pluginConfig: {
+        embedding: { provider: "none" },
+        softSuspect: { action: "none" },
+        advanced: {
+          minHistoryMessages: 1,
+          minMeaningfulTokens: 1,
+          minSignalChars: 1,
+          minSignalTokenCount: 1,
+          softConsecutiveSignals: 2,
+          softScoreThreshold: 0,
+          softNoveltyThreshold: 0,
+          hardScoreThreshold: 1,
+          hardNoveltyThreshold: 1,
+        },
+      },
+      resolveStorePathImpl: () => storePath,
+      resolveRouteImpl: () => ({
+        sessionKey,
+        agentId: "main",
+      }),
+    });
+    register(apiBundle.api);
+
+    await emitUserMessage(apiBundle.hooks, {
+      text: "baseline message alpha",
+      conversationId: "user-1",
+    });
+    await emitUserMessage(apiBundle.hooks, {
+      text: "firstcandidate shift context foo",
+      conversationId: "user-1",
+    });
+    await emitUserMessage(apiBundle.hooks, {
+      text: "secondcandidate shift context bar",
+      conversationId: "user-1",
+    });
+
+    const gatewayStop = getHook(apiBundle.hooks, "gateway_stop");
+    await gatewayStop({ reason: "test" }, {});
+
+    const persisted = (await readJson(persistencePath)) as {
+      sessionStateBySessionKey?: Record<
+        string,
+        {
+          history?: Array<{ tokens?: string[] }>;
+          pendingEntries?: unknown[];
+        }
+      >;
+    };
+    const sessionState = persisted.sessionStateBySessionKey?.[sessionKey];
+    expect(sessionState).toBeTruthy();
+    expect(sessionState?.history?.length).toBe(2);
+    const flattenedTokens = (sessionState?.history ?? []).flatMap((entry) => entry.tokens ?? []);
+    expect(flattenedTokens).toContain("firstcandidate");
+    expect(flattenedTokens).toContain("secondcandidate");
+    expect(sessionState?.pendingEntries ?? []).toHaveLength(0);
+  });
+
   it("does not register before_model_resolve fallback classification hook", async () => {
     const sdkState = createSdkMockState();
     const register = await importRegisterWithSdkMock(sdkState);

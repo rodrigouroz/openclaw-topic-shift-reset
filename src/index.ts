@@ -1286,20 +1286,29 @@ function classifyMessage(params: {
     params.lexical.score >= cfg.hardScoreThreshold ||
     (params.lexical.novelty >= cfg.hardNoveltyThreshold &&
       params.lexical.lexicalDistance >= 0.65);
-  const hardSignal =
-    hasSimilarity &&
-    (score >= cfg.hardScoreThreshold ||
-      (params.similarity <= cfg.hardSimilarityThreshold &&
-        params.lexical.novelty >= cfg.hardNoveltyThreshold));
+  // Require a strong combined score for immediate hard-rotate.
+  // Similarity+novelty spikes go through soft confirmation instead.
+  const hardSignal = hasSimilarity && score >= cfg.hardScoreThreshold;
 
   if (hardSignal) {
     return { kind: "rotate-hard", metrics, reason: "hard-threshold" };
   }
 
   const forceSoftPathFromLexicalHard = !hasSimilarity && lexicalHardSignal;
+  const forceSoftPathFromHardSimilarity =
+    hasSimilarity &&
+    params.similarity <= cfg.hardSimilarityThreshold &&
+    params.lexical.novelty >= cfg.hardNoveltyThreshold;
+  const embeddingLexicalOverrideSoftSignal =
+    hasSimilarity &&
+    params.lexical.lexicalDistance >= 0.9 &&
+    params.lexical.novelty >= cfg.softNoveltyThreshold &&
+    score >= cfg.softScoreThreshold - cfg.embeddingTriggerMargin;
   const softSignal =
     forceSoftPathFromLexicalHard ||
+    forceSoftPathFromHardSimilarity ||
     score >= cfg.softScoreThreshold ||
+    embeddingLexicalOverrideSoftSignal ||
     (hasSimilarity
       ? params.similarity <= cfg.softSimilarityThreshold &&
         params.lexical.novelty >= cfg.softNoveltyThreshold
@@ -1795,11 +1804,19 @@ async function rotateSessionEntry(params: {
     logger: params.api.logger,
   });
 
+  const seededHistory =
+    params.reason === "soft-confirmed"
+      ? trimHistory([...params.state.pendingEntries, params.entry], params.cfg.historyWindow)
+      : trimHistory([params.entry], params.cfg.historyWindow);
+
   params.state.lastResetAt = Date.now();
   params.state.pendingSoftSignals = 0;
   params.state.pendingEntries = [];
-  params.state.history = trimHistory([params.entry], params.cfg.historyWindow);
-  seedTopicCentroid(params.state, params.entry.embedding);
+  params.state.history = seededHistory;
+  seedTopicCentroid(params.state, undefined);
+  for (const historyEntry of seededHistory) {
+    updateTopicCentroid(params.state, historyEntry.embedding);
+  }
 
   params.api.logger.info(
     [
