@@ -1364,6 +1364,132 @@ function resolveSessionFilePathFromEntry(params: {
   return path.resolve(sessionsDir, `${sessionId}.jsonl`);
 }
 
+function formatSessionArchiveTimestamp(nowMs = Date.now()): string {
+  return new Date(nowMs).toISOString().replaceAll(":", "-");
+}
+
+async function archivePreviousSessionTranscript(params: {
+  storePath: string;
+  previousEntry?: SessionEntryLike;
+  logger: OpenClawPluginApi["logger"];
+}): Promise<string | null> {
+  const sessionFile = resolveSessionFilePathFromEntry({
+    storePath: params.storePath,
+    entry: params.previousEntry,
+  });
+  if (!sessionFile) {
+    return null;
+  }
+
+  const archivedPath = `${sessionFile}.reset.${formatSessionArchiveTimestamp()}`;
+  try {
+    await fs.rename(sessionFile, archivedPath);
+    return archivedPath;
+  } catch (error) {
+    const code =
+      error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : "";
+    if (code === "ENOENT") {
+      return null;
+    }
+    params.logger.warn(`topic-shift-reset: reset archive failed file=${sessionFile} err=${String(error)}`);
+    return null;
+  }
+}
+
+function normalizeRecoveryAgentId(agentId?: string): string {
+  const trimmed = typeof agentId === "string" ? agentId.trim() : "";
+  if (!trimmed) {
+    return "main";
+  }
+  return trimmed.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+async function recoverLegacyOrphanedSessionEntries(params: {
+  storePath: string;
+  agentId?: string;
+  logger: OpenClawPluginApi["logger"];
+}): Promise<number> {
+  let recovered = 0;
+  await withFileLock(params.storePath, LOCK_OPTIONS, async () => {
+    const loaded = await readJsonFileWithFallback<Record<string, SessionEntryLike>>(params.storePath, {});
+    const store = loaded.value;
+    const sessionsDir = path.dirname(params.storePath);
+    const entries = await fs.readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
+    if (entries.length === 0) {
+      return;
+    }
+
+    const referencedSessionIds = new Set<string>();
+    const referencedFiles = new Set<string>();
+    for (const entry of Object.values(store)) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const sessionId = typeof entry.sessionId === "string" ? entry.sessionId.trim() : "";
+      if (sessionId) {
+        referencedSessionIds.add(sessionId);
+      }
+      const sessionFile = resolveSessionFilePathFromEntry({
+        storePath: params.storePath,
+        entry,
+      });
+      if (sessionFile) {
+        referencedFiles.add(path.resolve(sessionFile));
+      }
+    }
+
+    let changed = false;
+    const recoveryAgentId = normalizeRecoveryAgentId(params.agentId);
+    for (const candidate of entries) {
+      if (!candidate.isFile()) {
+        continue;
+      }
+      const fileName = candidate.name;
+      if (!fileName.endsWith(".jsonl")) {
+        continue;
+      }
+      const fullPath = path.resolve(sessionsDir, fileName);
+      if (referencedFiles.has(fullPath)) {
+        continue;
+      }
+
+      const sessionId = fileName.slice(0, -".jsonl".length).trim();
+      if (!sessionId || referencedSessionIds.has(sessionId)) {
+        continue;
+      }
+
+      const stat = await fs.stat(fullPath).catch(() => null);
+      if (!stat || !stat.isFile()) {
+        continue;
+      }
+
+      const baseKey = `agent:${recoveryAgentId}:recovered:${sessionId}`;
+      let recoveryKey = baseKey;
+      let suffix = 2;
+      while (Object.prototype.hasOwnProperty.call(store, recoveryKey)) {
+        recoveryKey = `${baseKey}:${suffix}`;
+        suffix += 1;
+      }
+      store[recoveryKey] = {
+        sessionId,
+        updatedAt: Math.max(0, Math.floor(stat.mtimeMs)),
+        sessionFile: fileName,
+        systemSent: false,
+        abortedLastRun: false,
+      };
+      referencedSessionIds.add(sessionId);
+      referencedFiles.add(fullPath);
+      recovered += 1;
+      changed = true;
+    }
+
+    if (changed) {
+      await writeJsonFileAtomically(params.storePath, store);
+    }
+  });
+  return recovered;
+}
+
 function parseTranscriptTailLines(lines: string[], takeLast: number): TranscriptMessage[] {
   const messages: TranscriptMessage[] = [];
   for (let i = lines.length - 1; i >= 0; i -= 1) {
@@ -1663,6 +1789,11 @@ async function rotateSessionEntry(params: {
       contextKey: `topic-shift-reset:${params.contentHash}`,
     });
   }
+  const archivedTranscript = await archivePreviousSessionTranscript({
+    storePath,
+    previousEntry,
+    logger: params.api.logger,
+  });
 
   params.state.lastResetAt = Date.now();
   params.state.pendingSoftSignals = 0;
@@ -1681,6 +1812,7 @@ async function rotateSessionEntry(params: {
       `lex=${params.metrics.lexicalDistance.toFixed(3)}`,
       `sim=${typeof params.metrics.similarity === "number" ? params.metrics.similarity.toFixed(3) : "n/a"}`,
       `handoff=${handoff ? "1" : "0"}`,
+      `archived=${archivedTranscript ? "1" : "0"}`,
     ].join(" "),
   );
 
@@ -1696,6 +1828,7 @@ export default function register(api: OpenClawPluginApi): void {
   const pendingSoftSuspectSteeringBySession = new Map<string, number>();
   const awaitingSoftSuspectReplyBySession = new Map<string, number>();
   const sessionWorkQueue = new Map<string, Promise<unknown>>();
+  const orphanRecoveryByStorePath = new Map<string, Promise<void>>();
 
   const clearSoftSuspectSteerState = (sessionKey: string) => {
     pendingSoftSuspectSteeringBySession.delete(sessionKey);
@@ -1919,6 +2052,42 @@ export default function register(api: OpenClawPluginApi): void {
       }
       return;
     }
+
+    const ensureLegacyOrphanRecovery = async () => {
+      if (cfg.dryRun) {
+        return;
+      }
+      const storePath = api.runtime.channel.session.resolveStorePath(api.config.session?.store, {
+        agentId: params.agentId,
+      });
+      const normalizedStorePath = path.resolve(storePath);
+      const existing = orphanRecoveryByStorePath.get(normalizedStorePath);
+      if (existing) {
+        await existing;
+        return;
+      }
+      const pending = (async () => {
+        try {
+          const recovered = await recoverLegacyOrphanedSessionEntries({
+            storePath: normalizedStorePath,
+            agentId: params.agentId,
+            logger: api.logger,
+          });
+          if (recovered > 0) {
+            api.logger.info(
+              `topic-shift-reset: orphan-recovery recovered=${recovered} store=${normalizedStorePath}`,
+            );
+          }
+        } catch (error) {
+          api.logger.warn(
+            `topic-shift-reset: orphan-recovery failed store=${normalizedStorePath} err=${String(error)}`,
+          );
+        }
+      })();
+      orphanRecoveryByStorePath.set(normalizedStorePath, pending);
+      await pending;
+    };
+    await ensureLegacyOrphanRecovery();
 
     const rawText = params.text.trim();
     const text = cfg.stripEnvelope ? stripClassifierEnvelope(rawText, cfg.stripRules) : rawText;

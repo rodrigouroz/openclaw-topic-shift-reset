@@ -408,6 +408,159 @@ describe("openclaw-topic-shift-reset", () => {
     expect(sdkState.maxLocksByPath.get(path.resolve(storePath)) ?? 0).toBeLessThanOrEqual(1);
   });
 
+  it("archives prior transcript with reset suffix when rotating a session", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "topic-shift-reset-archive-"));
+    const storePath = path.join(rootDir, "agents", "main", "sessions", "sessions.json");
+    const sessionKey = "agent:main:main";
+    const initialSessionId = "main-initial-session";
+    const sessionsDir = path.dirname(storePath);
+    const priorTranscriptPath = path.join(sessionsDir, `${initialSessionId}.jsonl`);
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      storePath,
+      JSON.stringify(
+        {
+          [sessionKey]: {
+            sessionId: initialSessionId,
+            updatedAt: Date.now(),
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    await fs.writeFile(
+      priorTranscriptPath,
+      `${JSON.stringify({
+        type: "message",
+        message: { role: "user", content: [{ type: "input_text", text: "baseline transcript line" }] },
+      })}\n`,
+      "utf-8",
+    );
+
+    const sdkState = createSdkMockState();
+    const register = await importRegisterWithSdkMock(sdkState);
+    const apiBundle = createTestApi({
+      stateDirResolver: () => {
+        throw new Error("disable persistence for this test");
+      },
+      pluginConfig: {
+        embedding: { provider: "none" },
+        advanced: {
+          minHistoryMessages: 1,
+          minMeaningfulTokens: 1,
+          minSignalChars: 1,
+          minSignalTokenCount: 1,
+          softConsecutiveSignals: 1,
+          softScoreThreshold: 0,
+          softNoveltyThreshold: 0,
+          hardScoreThreshold: 1,
+          hardNoveltyThreshold: 1,
+        },
+      },
+      resolveStorePathImpl: () => storePath,
+      resolveRouteImpl: () => ({
+        sessionKey,
+        agentId: "main",
+      }),
+    });
+    register(apiBundle.api);
+
+    await emitUserMessage(apiBundle.hooks, {
+      text: "baseline warmup event",
+      conversationId: "user-1",
+    });
+    await emitUserMessage(apiBundle.hooks, {
+      text: "new shifted topic message two",
+      conversationId: "user-1",
+    });
+
+    const store = (await readJson(storePath)) as Record<string, { sessionId?: string }>;
+    expect(store[sessionKey]?.sessionId).toBeTruthy();
+    expect(store[sessionKey]?.sessionId).not.toBe(initialSessionId);
+
+    await expect(fs.stat(priorTranscriptPath)).rejects.toMatchObject({ code: "ENOENT" });
+    const archived = (await fs.readdir(sessionsDir)).find((name) =>
+      name.startsWith(`${initialSessionId}.jsonl.reset.`),
+    );
+    expect(archived).toBeTruthy();
+  });
+
+  it("recovers legacy orphan transcripts into session store entries once per store", async () => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "topic-shift-reset-recover-orphans-"));
+    const storePath = path.join(rootDir, "agents", "main", "sessions", "sessions.json");
+    const sessionsDir = path.dirname(storePath);
+    const sessionKey = "agent:main:main";
+    const activeSessionId = "active-session";
+    const orphanSessionId = "legacy-orphan-session";
+    const orphanTranscriptPath = path.join(sessionsDir, `${orphanSessionId}.jsonl`);
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      storePath,
+      JSON.stringify(
+        {
+          [sessionKey]: {
+            sessionId: activeSessionId,
+            updatedAt: Date.now(),
+          },
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    await fs.writeFile(
+      orphanTranscriptPath,
+      `${JSON.stringify({
+        type: "message",
+        message: { role: "user", content: [{ type: "input_text", text: "legacy orphan transcript line" }] },
+      })}\n`,
+      "utf-8",
+    );
+
+    const sdkState = createSdkMockState();
+    const register = await importRegisterWithSdkMock(sdkState);
+    const apiBundle = createTestApi({
+      stateDirResolver: () => {
+        throw new Error("disable persistence for this test");
+      },
+      pluginConfig: {
+        embedding: { provider: "none" },
+      },
+      resolveStorePathImpl: () => storePath,
+      resolveRouteImpl: () => ({
+        sessionKey,
+        agentId: "main",
+      }),
+    });
+    register(apiBundle.api);
+
+    await emitUserMessage(apiBundle.hooks, {
+      text: "trigger orphan recovery",
+      conversationId: "user-1",
+    });
+    await emitUserMessage(apiBundle.hooks, {
+      text: "trigger orphan recovery second message",
+      conversationId: "user-1",
+    });
+
+    const store = (await readJson(storePath)) as Record<
+      string,
+      { sessionId?: string; sessionFile?: string; updatedAt?: number }
+    >;
+    const recoveredEntry = Object.entries(store).find(([, entry]) => entry?.sessionId === orphanSessionId);
+    expect(recoveredEntry).toBeTruthy();
+    expect(recoveredEntry?.[0].startsWith("agent:main:recovered:")).toBe(true);
+    expect(recoveredEntry?.[1].sessionFile).toBe(`${orphanSessionId}.jsonl`);
+    expect(typeof recoveredEntry?.[1].updatedAt).toBe("number");
+
+    const recoveryLogs = apiBundle.logger.info.mock.calls.filter(([message]) =>
+      String(message).includes("topic-shift-reset: orphan-recovery recovered="),
+    );
+    expect(recoveryLogs).toHaveLength(1);
+  });
+
   it("downgrades lexical hard signals to suspect when similarity is unavailable", async () => {
     const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "topic-shift-reset-no-sim-hard-downgrade-"));
     const storePath = path.join(rootDir, "agents", "main", "sessions", "sessions.json");

@@ -147,10 +147,13 @@ All plugin logs are prefixed with `topic-shift-reset:`.
   No embedding backend is available; lexical signals only.
 - `restored state sessions=<n> rotations=<n>`
   Persisted runtime state restored at startup.
+- `orphan-recovery recovered=<n> store=<...>`
+  Re-linked legacy orphan transcript files (`*.jsonl`) back into session-store entries.
 - `would-rotate source=<user|agent> reason=<...> session=<...> ...`
   Dry-run rotation decision; no session mutation is written.
-- `rotated source=<user|agent> reason=<...> session=<...> ... handoff=<0|1>`
+- `rotated source=<user|agent> reason=<...> session=<...> ... handoff=<0|1> archived=<0|1>`
   Rotation executed (new `sessionId` written). `handoff=1` means handoff context was enqueued.
+  `archived=1` means the previous transcript file was archived as `.reset.<timestamp>`.
 
 ### Debug (`debug: true`)
 
@@ -183,6 +186,10 @@ All plugin logs are prefixed with `topic-shift-reset:`.
   Tail read optimization fell back to a full transcript read.
 - `handoff read failed file=<...> err=<...>`
   Could not read prior session transcript for handoff injection.
+- `reset archive failed file=<...> err=<...>`
+  Could not archive the prior session transcript after rotation.
+- `orphan-recovery failed store=<...> err=<...>`
+  Legacy orphan recovery scan failed for this session store.
 - `persistence disabled (state path): <err>`
   Plugin could not resolve state path; persistence is disabled.
 - `state flush failed err=<...>`
